@@ -1,0 +1,24 @@
+[package]
+name = "skyblock-proto"
+description = "skyblock wire protocol: keys, packets, frames, handshake, windows"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+aes.workspace = true
+aes-gcm.workspace = true
+base64.workspace = true
+hkdf.workspace = true
+rand.workspace = true
+sha2.workspace = true
+snow.workspace = true
+thiserror.workspace = true
+x25519-dalek.workspace = true
+
+[dev-dependencies]
+criterion.workspace = true
+
+[[bench]]
+name = "packet"
+harness = false

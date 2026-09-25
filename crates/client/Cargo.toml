@@ -1,0 +1,10 @@
+[package]
+name = "skyblock"
+description = "skyblock client"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+skyblock-proto.workspace = true
+clap.workspace = true

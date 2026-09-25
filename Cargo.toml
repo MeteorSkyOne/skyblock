@@ -1,0 +1,34 @@
+[workspace]
+resolver = "3"
+members = ["crates/proto", "crates/client", "crates/server"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+
+[workspace.dependencies]
+skyblock-proto = { path = "crates/proto" }
+
+aes = "0.9"
+aes-gcm = "0.11"
+base64 = "0.23"
+clap = { version = "4.6", features = ["derive"] }
+criterion = "0.8"
+hkdf = "0.13"
+rand = "0.10"
+sha2 = "0.11"
+# Without "std": snow's std feature pulls in ring, which needs a C toolchain
+# and complicates cross-compiling the server to musl.
+snow = { version = "0.10", default-features = false, features = ["default-resolver-crypto", "risky-raw-split"] }
+thiserror = "2"
+x25519-dalek = { version = "3", features = ["static_secrets"] }
+
+[profile.release]
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+
+[profile.bench]
+lto = "fat"
+codegen-units = 1
