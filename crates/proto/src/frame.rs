@@ -20,6 +20,7 @@ pub mod ty {
     pub const REKEY_INIT: u8 = 0x16;
     pub const REKEY_RESP: u8 = 0x17;
     pub const CLOSE: u8 = 0x18;
+    pub const TUNE: u8 = 0x19;
     pub const HS_INIT: u8 = 0x20;
     pub const HS_RESP: u8 = 0x21;
 }
@@ -33,7 +34,7 @@ pub const MAX_PATHS: usize = 8;
 
 const ECHO_OVERHEAD: usize = 1 + 4 + 1 + 4 + 8 + 2;
 const NACK_RANGE_LEN: usize = 4 + 2;
-const PATH_RX_LEN: usize = 1 + 8;
+const PATH_STATS_LEN: usize = 1 + 8 + 8 + 4 + 4;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Ip<'a> {
@@ -75,25 +76,36 @@ pub struct Pong {
     pub hold_us: u32,
 }
 
+/// Per-path counters in a `STATS` frame.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub struct PathRx {
+pub struct PathStats {
     pub path: u8,
+    /// Packets the frame's sender sent on this path.
+    pub tx_pkts: u64,
+    /// Authentic packets the frame's sender received on this path.
     pub rx_pkts: u64,
+    /// The frame sender's smoothed RTT and its variation on this path; 0
+    /// if it does not measure them.
+    pub srtt_us: u32,
+    pub rttvar_us: u32,
 }
 
-/// Cumulative receive counters.
+/// Cumulative counters, sent about once a second (SPEC §4.4).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct Stats {
+    /// Data items (sequence numbers) sent.
+    pub tx_unique: u64,
     pub rx_unique: u64,
     pub rx_dup: u64,
     pub rx_rescued: u64,
     n_paths: u8,
-    paths: [PathRx; MAX_PATHS],
+    paths: [PathStats; MAX_PATHS],
 }
 
 impl Stats {
-    pub fn new(rx_unique: u64, rx_dup: u64, rx_rescued: u64) -> Self {
+    pub fn new(tx_unique: u64, rx_unique: u64, rx_dup: u64, rx_rescued: u64) -> Self {
         Self {
+            tx_unique,
             rx_unique,
             rx_dup,
             rx_rescued,
@@ -102,7 +114,7 @@ impl Stats {
     }
 
     /// Adds a per-path counter; returns `false` once `MAX_PATHS` is reached.
-    pub fn push_path(&mut self, path: PathRx) -> bool {
+    pub fn push_path(&mut self, path: PathStats) -> bool {
         let n = usize::from(self.n_paths);
         if n == MAX_PATHS {
             return false;
@@ -112,9 +124,21 @@ impl Stats {
         true
     }
 
-    pub fn paths(&self) -> &[PathRx] {
+    pub fn paths(&self) -> &[PathStats] {
         &self.paths[..usize::from(self.n_paths)]
     }
+}
+
+/// Redundancy policy the client asks the node to use towards it (SPEC
+/// §4.2). Idempotent; the client repeats it with each of its `STATS`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Tune {
+    pub copies: u8,
+    /// Spread copies over at most this many of the best paths (0 = all).
+    pub paths: u8,
+    pub copy_delay_us: u32,
+    pub bulk_enter_kbps: u32,
+    pub bulk_exit_kbps: u32,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -185,6 +209,9 @@ pub struct ProbeResp {
     pub max_us: u32,
 }
 
+// `Stats` is ~230 bytes; frames only live on the stack while a packet is
+// parsed or built, and boxing would allocate on the hot path.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Frame<'a> {
     Ip(Ip<'a>),
@@ -200,6 +227,7 @@ pub enum Frame<'a> {
     RekeyInit(&'a [u8]),
     RekeyResp(&'a [u8]),
     Close(u8),
+    Tune(Tune),
     HsInit(&'a [u8]),
     HsResp(&'a [u8]),
 }
@@ -223,7 +251,7 @@ impl Frame<'_> {
             Frame::EchoReq(f) | Frame::EchoResp(f) => ECHO_OVERHEAD + f.payload.len(),
             Frame::Ping(_) => 1 + 1 + 4 + 8,
             Frame::Pong(_) => 1 + 1 + 4 + 8 + 4,
-            Frame::Stats(s) => 1 + 8 * 3 + 1 + s.paths().len() * PATH_RX_LEN,
+            Frame::Stats(s) => 1 + 8 * 4 + 1 + s.paths().len() * PATH_STATS_LEN,
             Frame::Nack(n) => 1 + 1 + n.raw.len(),
             Frame::ProbeReq(_) => 1 + 4 + 1 + 4 + 2 + 1 + 2,
             Frame::ProbeResp(_) => 1 + 4 + 1 + 1 + 4 + 4 + 4,
@@ -231,6 +259,7 @@ impl Frame<'_> {
                 1 + 2 + m.len()
             }
             Frame::Close(_) => 1 + 1,
+            Frame::Tune(_) => 1 + 1 + 1 + 4 + 4 + 4,
         }
     }
 }
@@ -293,12 +322,17 @@ impl<'a> FrameWriter<'a> {
             }
             Frame::Stats(s) => {
                 w.u8(ty::STATS)
+                    .u64(s.tx_unique)
                     .u64(s.rx_unique)
                     .u64(s.rx_dup)
                     .u64(s.rx_rescued)
                     .u8(s.n_paths);
                 for p in s.paths() {
-                    w.u8(p.path).u64(p.rx_pkts);
+                    w.u8(p.path)
+                        .u64(p.tx_pkts)
+                        .u64(p.rx_pkts)
+                        .u32(p.srtt_us)
+                        .u32(p.rttvar_us);
                 }
             }
             Frame::Nack(n) => {
@@ -333,6 +367,14 @@ impl<'a> FrameWriter<'a> {
             }
             Frame::Close(reason) => {
                 w.u8(ty::CLOSE).u8(*reason);
+            }
+            Frame::Tune(t) => {
+                w.u8(ty::TUNE)
+                    .u8(t.copies)
+                    .u8(t.paths)
+                    .u32(t.copy_delay_us)
+                    .u32(t.bulk_enter_kbps)
+                    .u32(t.bulk_exit_kbps);
             }
             Frame::HsInit(m) => {
                 w.u8(ty::HS_INIT);
@@ -446,15 +488,18 @@ impl<'a> FrameReader<'a> {
                 hold_us: r.u32()?,
             }),
             ty::STATS => {
-                let mut s = Stats::new(r.u64()?, r.u64()?, r.u64()?);
+                let mut s = Stats::new(r.u64()?, r.u64()?, r.u64()?, r.u64()?);
                 let n = r.u8()?;
                 if usize::from(n) > MAX_PATHS {
                     return Err(Error::MalformedFrame);
                 }
                 for _ in 0..n {
-                    s.push_path(PathRx {
+                    s.push_path(PathStats {
                         path: r.u8()?,
+                        tx_pkts: r.u64()?,
                         rx_pkts: r.u64()?,
+                        srtt_us: r.u32()?,
+                        rttvar_us: r.u32()?,
                     });
                 }
                 Frame::Stats(s)
@@ -487,6 +532,13 @@ impl<'a> FrameReader<'a> {
             ty::REKEY_INIT => Frame::RekeyInit(r.blob16()?),
             ty::REKEY_RESP => Frame::RekeyResp(r.blob16()?),
             ty::CLOSE => Frame::Close(r.u8()?),
+            ty::TUNE => Frame::Tune(Tune {
+                copies: r.u8()?,
+                paths: r.u8()?,
+                copy_delay_us: r.u32()?,
+                bulk_enter_kbps: r.u32()?,
+                bulk_exit_kbps: r.u32()?,
+            }),
             ty::HS_INIT => Frame::HsInit(r.blob16()?),
             ty::HS_RESP => Frame::HsResp(r.blob16()?),
             other => return Err(Error::UnknownFrame(other)),
@@ -591,14 +643,20 @@ mod tests {
     use super::*;
 
     fn samples() -> Vec<Frame<'static>> {
-        let mut stats = Stats::new(1_000_000, 42, 7);
-        stats.push_path(PathRx {
+        let mut stats = Stats::new(999, 1_000_000, 42, 7);
+        stats.push_path(PathStats {
             path: 0,
+            tx_pkts: 3,
             rx_pkts: 500_000,
+            srtt_us: 158_900,
+            rttvar_us: 400,
         });
-        stats.push_path(PathRx {
+        stats.push_path(PathStats {
             path: 1,
+            tx_pkts: u64::MAX,
             rx_pkts: u64::MAX,
+            srtt_us: u32::MAX,
+            rttvar_us: 0,
         });
         vec![
             Frame::Ip(Ip {
@@ -664,6 +722,13 @@ mod tests {
             Frame::RekeyInit(&[7; 108]),
             Frame::RekeyResp(&[8; 61]),
             Frame::Close(4),
+            Frame::Tune(Tune {
+                copies: 2,
+                paths: 0,
+                copy_delay_us: 2000,
+                bulk_enter_kbps: 2000,
+                bulk_exit_kbps: 1000,
+            }),
             Frame::HsInit(&[1; 108]),
             Frame::HsResp(&[2; 61]),
         ]
@@ -785,9 +850,9 @@ mod tests {
 
         // too many STATS paths
         let mut bad_stats = vec![ty::STATS];
-        bad_stats.extend_from_slice(&[0; 24]);
+        bad_stats.extend_from_slice(&[0; 32]);
         bad_stats.push(MAX_PATHS as u8 + 1);
-        bad_stats.extend_from_slice(&[0; 9 * (MAX_PATHS + 1)]);
+        bad_stats.extend_from_slice(&[0; PATH_STATS_LEN * (MAX_PATHS + 1)]);
         assert!(FrameReader::new(&bad_stats).next().unwrap().is_err());
 
         // unknown probe kind

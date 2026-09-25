@@ -21,6 +21,8 @@ pub struct TxState {
     keys: Keyset,
     pn: u64,
     seq: u32,
+    /// Sequence numbers allocated so far (the `tx_unique` of `STATS`).
+    items: u64,
     pad_max: usize,
     rng: StdRng,
     buf: PacketBuf,
@@ -32,10 +34,23 @@ impl TxState {
             keys,
             pn: 0,
             seq: 0,
+            items: 0,
             pad_max,
             rng: StdRng::from_rng(&mut rand::rng()),
             buf: PacketBuf::new(),
         }
+    }
+
+    /// Data items sent, counting each fragment.
+    pub fn items_sent(&self) -> u64 {
+        self.items
+    }
+
+    fn alloc_seq(&mut self, n: u32) -> u32 {
+        let seq = self.seq;
+        self.seq = self.seq.wrapping_add(n);
+        self.items += u64::from(n);
+        seq
     }
 
     /// Seals one packet of control frames written by `f`.
@@ -55,8 +70,7 @@ impl TxState {
         } else {
             ip.len().div_ceil(MAX_BODY - IP_FRAG_OVERHEAD) as u32
         };
-        let seq = self.seq;
-        self.seq = self.seq.wrapping_add(n);
+        let seq = self.alloc_seq(n);
         self.send_ip_as(seq, 0, ip, emit)?;
         Ok(seq)
     }
@@ -92,19 +106,42 @@ impl TxState {
         Ok(())
     }
 
-    /// Sends a data-class echo frame (used by `bench`); allocates its own
-    /// sequence number.
-    pub fn send_echo(&mut self, request: bool, echo: Echo<'_>) -> Result<&[u8], Error> {
-        let seq = self.seq;
-        self.seq = self.seq.wrapping_add(1);
-        let e = Echo { seq, ..echo };
+    /// Sends copy 0 of an echo frame (used by `bench`) under a new sequence
+    /// number, which it returns; `echo.seq` and `echo.copy` are ignored.
+    pub fn send_echo(
+        &mut self,
+        request: bool,
+        echo: Echo<'_>,
+        emit: impl FnOnce(&[u8]),
+    ) -> Result<u32, Error> {
+        let seq = self.alloc_seq(1);
+        self.send_echo_as(
+            request,
+            Echo {
+                seq,
+                copy: 0,
+                ..echo
+            },
+            emit,
+        )?;
+        Ok(seq)
+    }
+
+    /// Sends an echo frame with the sequence number and copy it carries.
+    pub fn send_echo_as(
+        &mut self,
+        request: bool,
+        echo: Echo<'_>,
+        emit: impl FnOnce(&[u8]),
+    ) -> Result<(), Error> {
         let frame = if request {
-            Frame::EchoReq(e)
+            Frame::EchoReq(echo)
         } else {
-            Frame::EchoResp(e)
+            Frame::EchoResp(echo)
         };
         let pad_max = self.pad_max;
-        self.seal(pad_max, |w| w.write(&frame))
+        emit(self.seal(pad_max, |w| w.write(&frame))?);
+        Ok(())
     }
 
     fn seal(

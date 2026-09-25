@@ -71,6 +71,18 @@ enum Command {
         #[arg(long, default_value_t = 2000)]
         wait_ms: u64,
     },
+    /// Accepts TCP connections and sends zeros as fast as possible.
+    TcpSource {
+        #[arg(long)]
+        bind: SocketAddr,
+    },
+    /// Downloads from a `tcp-source` for a while and reports throughput.
+    TcpSink {
+        #[arg(long)]
+        target: SocketAddr,
+        #[arg(long, default_value_t = 10)]
+        secs: u64,
+    },
 }
 
 fn main() -> ExitCode {
@@ -99,6 +111,8 @@ fn main() -> ExitCode {
             count,
             wait_ms,
         } => probe(target, count, wait_ms),
+        Command::TcpSource { bind } => tcp_source(bind),
+        Command::TcpSink { target, secs } => tcp_sink(target, secs),
     };
     match result {
         Ok(true) => ExitCode::SUCCESS,
@@ -137,7 +151,7 @@ fn echo(bind: SocketAddr) -> Res {
     }
 }
 
-fn report(prefix: &str, sent: u32, mut rtts: Vec<Duration>) {
+fn report(prefix: &str, sent: u32, mut rtts: Vec<Duration>, extra: &str) {
     rtts.sort();
     let us = |d: Duration| d.as_secs_f64() * 1e6;
     let pct = |p: f64| {
@@ -154,7 +168,7 @@ fn report(prefix: &str, sent: u32, mut rtts: Vec<Duration>) {
         rtts.iter().map(|d| us(*d)).sum::<f64>() / rtts.len() as f64
     };
     println!(
-        "{prefix} sent={sent} recv={recv} loss_pct={:.2} min_us={:.0} p50_us={:.0} p99_us={:.0} max_us={:.0} mean_us={:.0}",
+        "{prefix} sent={sent} recv={recv} loss_pct={:.2} min_us={:.0} p50_us={:.0} p99_us={:.0} max_us={:.0} mean_us={:.0}{extra}",
         100.0 * f64::from(sent - recv.min(sent)) / f64::from(sent.max(1)),
         pct(0.0),
         pct(0.5),
@@ -172,8 +186,9 @@ fn udp_ping(target: SocketAddr, count: u32, interval_ms: u64, size: usize) -> Re
     let start = Instant::now();
     let size = size.max(12);
     let rtts = Arc::new(Mutex::new(vec![None::<Duration>; count as usize]));
+    let dups = Arc::new(std::sync::atomic::AtomicU32::new(0));
 
-    let (rx_sock, rx_rtts) = (Arc::clone(&sock), Arc::clone(&rtts));
+    let (rx_sock, rx_rtts, rx_dups) = (Arc::clone(&sock), Arc::clone(&rtts), Arc::clone(&dups));
     let done = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let rx_done = Arc::clone(&done);
     let receiver = std::thread::spawn(move || {
@@ -189,6 +204,9 @@ fn udp_ping(target: SocketAddr, count: u32, interval_ms: u64, size: usize) -> Re
             let sent_us = u64::from_be_bytes(buf[4..12].try_into().unwrap());
             let rtt = start.elapsed() - Duration::from_micros(sent_us);
             if let Some(slot) = rx_rtts.lock().unwrap().get_mut(seq) {
+                if slot.is_some() {
+                    rx_dups.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
                 slot.get_or_insert(rtt);
             }
         }
@@ -204,9 +222,20 @@ fn udp_ping(target: SocketAddr, count: u32, interval_ms: u64, size: usize) -> Re
     std::thread::sleep(Duration::from_secs(1));
     done.store(true, std::sync::atomic::Ordering::Relaxed);
     receiver.join().ok();
-    let rtts: Vec<Duration> = rtts.lock().unwrap().iter().flatten().copied().collect();
+    let slots = rtts.lock().unwrap().clone();
+    // Longest run of consecutive lost pings (outages).
+    let (mut run, mut max_run) = (0u32, 0u32);
+    for got in slots.iter().map(Option::is_some) {
+        run = if got { 0 } else { run + 1 };
+        max_run = max_run.max(run);
+    }
+    let rtts: Vec<Duration> = slots.into_iter().flatten().collect();
     let ok = !rtts.is_empty();
-    report("udp", count, rtts);
+    let extra = format!(
+        " dup={} max_run={max_run}",
+        dups.load(std::sync::atomic::Ordering::Relaxed)
+    );
+    report("udp", count, rtts, &extra);
     Ok(ok)
 }
 
@@ -228,8 +257,41 @@ fn tcp_ping(target: SocketAddr, count: u32, interval_ms: u64, size: usize) -> Re
     }
     println!("tcp connect_us={:.0}", connect.as_secs_f64() * 1e6);
     let ok = back == msg;
-    report("tcp", count, rtts);
+    report("tcp", count, rtts, "");
     Ok(ok)
+}
+
+fn tcp_source(bind: SocketAddr) -> Res {
+    let listener = TcpListener::bind(bind)?;
+    eprintln!("tcp source on {bind}");
+    for stream in listener.incoming().flatten() {
+        std::thread::spawn(move || {
+            let mut s = stream;
+            let chunk = [0u8; 65536];
+            while s.write_all(&chunk).is_ok() {}
+        });
+    }
+    Ok(true)
+}
+
+fn tcp_sink(target: SocketAddr, secs: u64) -> Res {
+    let mut s = TcpStream::connect_timeout(&target, Duration::from_secs(5))?;
+    s.set_read_timeout(Some(Duration::from_secs(2)))?;
+    let start = Instant::now();
+    let mut buf = vec![0u8; 65536];
+    let mut total = 0u64;
+    while start.elapsed() < Duration::from_secs(secs) {
+        match s.read(&mut buf) {
+            Ok(0) | Err(_) => break,
+            Ok(n) => total += n as u64,
+        }
+    }
+    let el = start.elapsed().as_secs_f64();
+    println!(
+        "tcp_sink bytes={total} secs={el:.1} mbps={:.1}",
+        total as f64 * 8.0 / el / 1e6
+    );
+    Ok(total > 0)
 }
 
 fn udp_listen(bind: SocketAddr, prime: SocketAddr, wait_ms: u64) -> Res {

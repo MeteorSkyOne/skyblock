@@ -1,6 +1,6 @@
-//! Transport-independent server logic (SPEC §3.6–3.9, §7.2): handshakes,
-//! sessions, paths and frame handling. The event loop feeds datagrams in
-//! and performs the I/O requested through [`ServerIo`].
+//! Transport-independent server logic (SPEC §3.6–3.9, §4, §7.2): handshakes,
+//! sessions, paths, redundant sending and frame handling. The event loop
+//! feeds datagrams in and performs the I/O requested through [`ServerIo`].
 
 use std::collections::HashMap;
 use std::net::{Ipv4Addr, SocketAddr};
@@ -8,13 +8,18 @@ use std::net::{Ipv4Addr, SocketAddr};
 use rand::SeedableRng;
 use rand::rngs::StdRng;
 use skyblock_proto::Micros;
-use skyblock_proto::frame::{Frame, FrameReader, Pong};
+use skyblock_proto::flow::{Class, FlowClassifier, FlowKey};
+use skyblock_proto::frame::{Frame, FrameReader, PathStats, Pong, Stats};
 use skyblock_proto::handshake::{MAX_MSG_LEN, PendingResponse, ServerHello};
 use skyblock_proto::ip::Ipv4Packet;
 use skyblock_proto::keys::{PrivateKey, Psk, PublicKey, SessionKeys};
 use skyblock_proto::packet::{MIN_LEN, PacketBuf};
+use skyblock_proto::path::{PathMetrics, Ranking, down_after};
+use skyblock_proto::sched::{Plan, Policy, SchedStats, Scheduler};
 use skyblock_proto::session::{Data, RxState, TxState, open_handshake, seal_handshake};
-use skyblock_proto::timing::{PATH_FORGET, SECOND, SERVER_SESSION_EXPIRE};
+use skyblock_proto::timing::{
+    ACTIVE_WINDOW, PATH_FORGET, SECOND, SERVER_SESSION_EXPIRE, STATS_ACTIVE, STATS_IDLE,
+};
 use tracing::{debug, info};
 
 use crate::filter::InnerFilter;
@@ -62,10 +67,14 @@ pub struct CoreStats {
     pub rejected_handshakes: u64,
     pub rate_limited: u64,
     pub unauthenticated: u64,
+    /// Packets from an unknown address matched to a session by trial
+    /// decryption (new paths, NAT rebinding).
     pub roamed: u64,
     pub filtered: u64,
     pub delivered: u64,
+    /// Inner packets sent to clients, and those sent as bulk (one copy).
     pub sent: u64,
+    pub sent_bulk: u64,
 }
 
 struct Path {
@@ -73,21 +82,41 @@ struct Path {
     id: Option<u8>,
     sock: usize,
     addr: SocketAddr,
-    last_rx: Micros,
+    m: PathMetrics,
 }
 
 struct Session {
     tx: TxState,
     rx: RxState,
+    sched: Scheduler,
+    policy: Policy,
+    flows: FlowClassifier,
     /// Set once the client sent something under the session keys.
     confirmed: bool,
     paths: Vec<Path>,
+    ranking: Ranking,
     last_rx: Micros,
+    /// Last inner data either way; 0 = never.
+    last_active: Micros,
+    next_stats: Micros,
 }
 
 impl Session {
-    fn best_path(&self) -> Option<&Path> {
-        self.paths.iter().max_by_key(|p| p.last_rx)
+    fn active(&self, now: Micros) -> bool {
+        self.last_active != 0 && now.saturating_sub(self.last_active) < ACTIVE_WINDOW
+    }
+
+    fn touch(&mut self, now: Micros) {
+        if !self.active(now) {
+            self.next_stats = self.next_stats.min(now + STATS_ACTIVE);
+        }
+        self.last_active = now;
+    }
+
+    fn rerank(&mut self, now: Micros) {
+        let down = down_after(self.active(now));
+        self.ranking
+            .update(now, down, self.paths.iter().map(|p| &p.m));
     }
 }
 
@@ -146,6 +175,18 @@ impl Core {
         self.sessions.iter().flatten().count()
     }
 
+    /// Redundancy counters summed over the live sessions.
+    pub fn sched_stats(&self) -> SchedStats {
+        self.sessions
+            .iter()
+            .flatten()
+            .fold(SchedStats::default(), |mut acc, s| {
+                acc.copies_sent += s.sched.stats.copies_sent;
+                acc.copies_dropped += s.sched.stats.copies_dropped;
+                acc
+            })
+    }
+
     /// Processes one datagram received on local socket `sock`. `pkt` is
     /// decrypted in place.
     pub fn handle_datagram(
@@ -170,7 +211,7 @@ impl Core {
             self.on_handshake(now, sock, from, body, io);
             return;
         }
-        // Unknown address: maybe a client that roamed or opened a new path.
+        // Unknown address: a client that roamed or opened a new path.
         if self.trial_limit.allow(now, from.ip()) {
             for u in 0..self.sessions.len() {
                 if Some(u) != known
@@ -185,33 +226,79 @@ impl Core {
         self.stats.unauthenticated += 1;
     }
 
-    /// Sends an inner packet to `user`'s client. Returns whether it was sent.
-    pub fn send_ip(
-        &mut self,
-        _now: Micros,
-        user: usize,
-        ip: &[u8],
-        io: &mut impl ServerIo,
-    ) -> bool {
+    /// Sends an inner packet to `user`'s client with the redundancy its
+    /// flow gets. Returns whether it was sent.
+    pub fn send_ip(&mut self, now: Micros, user: usize, ip: &[u8], io: &mut impl ServerIo) -> bool {
         let Some(Some(s)) = self.sessions.get_mut(user) else {
             return false;
         };
         if !s.confirmed {
             return false;
         }
-        let Some(p) = s.best_path() else {
+        let Ok(p) = Ipv4Packet::parse(ip) else {
             return false;
         };
-        let (sock, addr) = (p.sock, p.addr);
-        let ok = s.tx.send_ip(ip, |pkt| io.send(sock, addr, pkt)).is_ok();
+        s.touch(now);
+        let flow = s.flows.classify(now, FlowKey::of(&p), ip.len());
+        let plan = Plan::for_flow(&s.policy, flow);
+        let Session {
+            tx,
+            sched,
+            paths,
+            ranking,
+            ..
+        } = s;
+        let ok = sched
+            .send_ip(tx, now, ip, plan, ranking, |i, pkt| {
+                if let Some(p) = paths.get_mut(i) {
+                    p.m.tx_pkts += 1;
+                    io.send(p.sock, p.addr, pkt);
+                }
+            })
+            .is_ok();
         if ok {
             self.stats.sent += 1;
+            if flow.class == Class::Bulk {
+                self.stats.sent_bulk += 1;
+            }
         }
         ok
     }
 
-    /// Housekeeping: expires sessions, paths, reassemblies, rate limiters.
-    pub fn tick(&mut self, now: Micros) {
+    /// Sends delayed copies that are due.
+    pub fn poll(&mut self, now: Micros, io: &mut impl ServerIo) {
+        for s in self.sessions.iter_mut().flatten() {
+            if s.sched.next_due().is_none_or(|d| d > now) {
+                continue;
+            }
+            let Session {
+                tx,
+                sched,
+                paths,
+                ranking,
+                ..
+            } = s;
+            sched.poll(tx, now, ranking, |i, pkt| {
+                if let Some(p) = paths.get_mut(i) {
+                    p.m.tx_pkts += 1;
+                    io.send(p.sock, p.addr, pkt);
+                }
+            });
+        }
+    }
+
+    /// When the earliest delayed copy is due.
+    pub fn next_due(&self) -> Option<Micros> {
+        self.sessions
+            .iter()
+            .flatten()
+            .filter_map(|s| s.sched.next_due())
+            .min()
+    }
+
+    /// Housekeeping: STATS, path ranking, and expiry of sessions, paths,
+    /// flows, reassemblies and rate limiters.
+    pub fn tick(&mut self, now: Micros, io: &mut impl ServerIo) {
         for u in 0..self.sessions.len() {
             let Some(s) = &mut self.sessions[u] else {
                 continue;
@@ -223,14 +310,19 @@ impl Core {
                 continue;
             }
             s.rx.expire(now);
+            s.flows.expire(now);
             let by_addr = &mut self.by_addr;
             s.paths.retain(|p| {
-                let keep = now.saturating_sub(p.last_rx) <= PATH_FORGET;
+                let keep = now.saturating_sub(p.m.last_rx) <= PATH_FORGET;
                 if !keep {
                     by_addr.remove(&(p.sock, p.addr));
                 }
                 keep
             });
+            s.rerank(now);
+            if s.confirmed && now >= s.next_stats {
+                send_stats(s, now, io);
+            }
         }
         self.hs_limit.cleanup(now);
         self.trial_limit.cleanup(now);
@@ -272,6 +364,7 @@ impl Core {
             return;
         }
         user.last_ts = pending.hello.timestamp;
+        let n_paths = pending.hello.n_paths;
         let hello = ServerHello {
             vip: user.vip,
             resolver: self.params.resolver,
@@ -289,18 +382,27 @@ impl Core {
         };
 
         self.drop_session(u);
-        self.sessions[u] = Some(Session {
+        let policy = Policy::SINGLE;
+        let mut s = Session {
             tx: TxState::new(keys.s2c, self.params.pad_max),
             rx: RxState::new(keys.c2s),
+            sched: Scheduler::new(),
+            policy,
+            flows: FlowClassifier::new(policy.bulk_enter_kbps, policy.bulk_exit_kbps),
             confirmed: false,
             paths: vec![Path {
                 id: None,
                 sock,
                 addr: from,
-                last_rx: now,
+                m: PathMetrics::new(now),
             }],
+            ranking: Ranking::default(),
             last_rx: now,
-        });
+            last_active: 0,
+            next_stats: now + STATS_IDLE,
+        };
+        s.rerank(now);
+        self.sessions[u] = Some(s);
         self.by_addr.insert((sock, from), u);
         if let Ok(pkt) = seal_handshake(
             &self.obfs.s2c,
@@ -311,7 +413,7 @@ impl Core {
             io.send(sock, from, pkt);
         }
         self.stats.handshakes += 1;
-        info!(user = %self.users[u].name, %from, "session established");
+        info!(user = %self.users[u].name, %from, paths = n_paths, "session established");
     }
 
     /// Tries `pkt` against `u`'s session keys; returns whether it was
@@ -341,7 +443,7 @@ impl Core {
         };
         s.last_rx = now;
         s.confirmed = true;
-        let path = match s
+        let mut path = match s
             .paths
             .iter()
             .position(|p| p.sock == sock && p.addr == from)
@@ -353,13 +455,14 @@ impl Core {
                     id: None,
                     sock,
                     addr: from,
-                    last_rx: now,
+                    m: PathMetrics::new(now),
                 });
                 by_addr.insert((sock, from), u);
+                s.rerank(now);
                 s.paths.len() - 1
             }
         };
-        s.paths[path].last_rx = now;
+        s.paths[path].m.on_rx(now);
 
         let vip = users[u].vip;
         let mut close = false;
@@ -367,7 +470,7 @@ impl Core {
             let Ok(frame) = frame else { break };
             match frame {
                 Frame::Ping(p) => {
-                    s.paths[path].id = Some(p.path);
+                    path = learn_path_id(s, by_addr, path, p.path, now);
                     let pong = Frame::Pong(Pong {
                         path: p.path,
                         id: p.id,
@@ -375,28 +478,80 @@ impl Core {
                         hold_us: 0,
                     });
                     if let Ok(out) = s.tx.control(|w| w.write(&pong)) {
-                        io.send(sock, from, out);
+                        let p = &mut s.paths[path];
+                        p.m.tx_pkts += 1;
+                        io.send(p.sock, p.addr, out);
                     }
+                }
+                Frame::Tune(t) => {
+                    let policy = Policy::from_tune(&t);
+                    if policy != s.policy {
+                        debug!(user = %users[u].name, ?policy, "redundancy policy");
+                        s.flows
+                            .set_thresholds(policy.bulk_enter_kbps, policy.bulk_exit_kbps);
+                        s.policy = policy;
+                    }
+                }
+                Frame::Stats(st) => {
+                    for ps in st.paths() {
+                        if let Some(p) = s.paths.iter_mut().find(|p| p.id == Some(ps.path)) {
+                            p.m.on_peer_stats(ps.tx_pkts, ps.rx_pkts);
+                            if ps.srtt_us > 0 {
+                                p.m.rtt
+                                    .adopt(Micros::from(ps.srtt_us), Micros::from(ps.rttvar_us));
+                            }
+                        }
+                    }
+                    s.rerank(now);
                 }
                 Frame::Close(_) => close = true,
                 _ => match s.rx.accept(now, &frame) {
-                    Some(Data::Ip(ip)) => match Ipv4Packet::parse(ip) {
-                        Ok(p) => match filter.check(vip, &p) {
-                            Ok(()) => {
-                                stats.delivered += 1;
-                                io.deliver(u, p.as_bytes());
-                            }
-                            Err(reason) => {
-                                stats.filtered += 1;
-                                debug!(user = %users[u].name, dst = %p.dst(), ?reason, "inner packet filtered");
-                            }
-                        },
-                        Err(_) => stats.filtered += 1,
-                    },
-                    Some(Data::EchoReq(e)) => {
-                        if let Ok(out) = s.tx.send_echo(false, e) {
-                            io.send(sock, from, out);
+                    Some(Data::Ip(ip)) => {
+                        match Ipv4Packet::parse(ip) {
+                            Ok(p) => match filter.check(vip, &p) {
+                                Ok(()) => {
+                                    stats.delivered += 1;
+                                    io.deliver(u, p.as_bytes());
+                                }
+                                Err(reason) => {
+                                    stats.filtered += 1;
+                                    debug!(user = %users[u].name, dst = %p.dst(), ?reason, "inner packet filtered");
+                                }
+                            },
+                            Err(_) => stats.filtered += 1,
                         }
+                        s.touch(now);
+                    }
+                    Some(Data::EchoReq(e)) => {
+                        let (id, ts) = (e.id, e.ts);
+                        let mut payload = [0u8; 1500];
+                        let n = e.payload.len().min(payload.len());
+                        payload[..n].copy_from_slice(&e.payload[..n]);
+                        s.touch(now);
+                        let plan = Plan::redundant(&s.policy);
+                        let Session {
+                            tx,
+                            sched,
+                            paths,
+                            ranking,
+                            ..
+                        } = s;
+                        let _ = sched.send_echo(
+                            tx,
+                            now,
+                            false,
+                            id,
+                            ts,
+                            &payload[..n],
+                            plan,
+                            ranking,
+                            |i, pkt| {
+                                if let Some(p) = paths.get_mut(i) {
+                                    p.m.tx_pkts += 1;
+                                    io.send(p.sock, p.addr, pkt);
+                                }
+                            },
+                        );
                     }
                     _ => {}
                 },
@@ -418,12 +573,77 @@ impl Core {
     }
 }
 
+/// Records that path slot `idx` is the client's path `id`. If another slot
+/// held that id (the client's NAT mapping for it changed), this slot takes
+/// over its counters and the old slot is removed. Returns `idx`'s position
+/// after the removal.
+fn learn_path_id(
+    s: &mut Session,
+    by_addr: &mut HashMap<(usize, SocketAddr), usize>,
+    idx: usize,
+    id: u8,
+    now: Micros,
+) -> usize {
+    if s.paths[idx].id == Some(id) {
+        return idx;
+    }
+    s.paths[idx].id = Some(id);
+    let Some(old) = s
+        .paths
+        .iter()
+        .enumerate()
+        .position(|(i, p)| i != idx && p.id == Some(id))
+    else {
+        return idx;
+    };
+    let gone = s.paths.remove(old);
+    by_addr.remove(&(gone.sock, gone.addr));
+    let idx = if old < idx { idx - 1 } else { idx };
+    s.paths[idx].m.absorb(&gone.m);
+    debug!(path = id, from = %gone.addr, to = %s.paths[idx].addr, "path moved");
+    s.rerank(now);
+    idx
+}
+
+fn send_stats(s: &mut Session, now: Micros, io: &mut impl ServerIo) {
+    let mut st = Stats::new(
+        s.tx.items_sent(),
+        s.rx.stats.unique,
+        s.rx.stats.dup,
+        s.rx.stats.rescued,
+    );
+    for p in &s.paths {
+        if let Some(id) = p.id {
+            st.push_path(PathStats {
+                path: id,
+                tx_pkts: p.m.tx_pkts,
+                rx_pkts: p.m.rx_pkts,
+                srtt_us: 0,
+                rttvar_us: 0,
+            });
+        }
+    }
+    s.next_stats = now
+        + if s.active(now) {
+            STATS_ACTIVE
+        } else {
+            STATS_IDLE
+        };
+    let Some(i) = s.ranking.best() else { return };
+    if let Ok(out) = s.tx.control(|w| w.write(&Frame::Stats(st))) {
+        let p = &mut s.paths[i];
+        p.m.tx_pkts += 1;
+        io.send(p.sock, p.addr, out);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use skyblock_proto::frame::Ping;
+    use skyblock_proto::frame::{Echo, Ping, Tune};
     use skyblock_proto::handshake::{ClientHello, Initiator, next_timestamp};
     use skyblock_proto::ip::build_udp;
+    use skyblock_proto::timing::MS;
     use std::net::SocketAddrV4;
 
     const VIP: Ipv4Addr = Ipv4Addr::new(10, 77, 0, 2);
@@ -545,14 +765,42 @@ mod tests {
             out.remove(0)
         }
 
-        fn client_ping(&mut self, id: u32) -> Vec<u8> {
+        fn client_control(&mut self, frames: &[Frame<'_>]) -> Vec<u8> {
             self.client
                 .tx
                 .as_mut()
                 .unwrap()
-                .control(|w| w.write(&Frame::Ping(Ping { path: 0, id, ts: 5 })))
+                .control(|w| frames.iter().try_for_each(|f| w.write(f)))
                 .unwrap()
                 .to_vec()
+        }
+
+        fn client_ping(&mut self, path: u8, id: u32) -> Vec<u8> {
+            self.client_control(&[Frame::Ping(Ping { path, id, ts: 5 })])
+        }
+
+        /// Registers `n` paths from ports 1000, 1001, ... with copies/delay.
+        fn connect(&mut self, n: u8, copies: u8, delay_us: u32) {
+            self.handshake(addr(1000));
+            let tune = Frame::Tune(Tune {
+                copies,
+                paths: 0,
+                copy_delay_us: delay_us,
+                bulk_enter_kbps: 2000,
+                bulk_exit_kbps: 1000,
+            });
+            for i in 0..n {
+                let pkt = self.client_control(&[
+                    Frame::Ping(Ping {
+                        path: i,
+                        id: 1,
+                        ts: 5,
+                    }),
+                    tune,
+                ]);
+                self.feed(1, addr(1000 + u16::from(i)), &pkt);
+            }
+            self.io.sent.clear();
         }
 
         /// Opens a server->client packet and returns its frames' debug text.
@@ -566,13 +814,17 @@ mod tests {
     }
 
     fn udp(src: Ipv4Addr, dst: Ipv4Addr) -> Vec<u8> {
-        let mut b = vec![0u8; 128];
+        udp_sized(src, 9000, dst, 4)
+    }
+
+    fn udp_sized(src: Ipv4Addr, sport: u16, dst: Ipv4Addr, len: usize) -> Vec<u8> {
+        let mut b = vec![0u8; 64 + len];
         let n = build_udp(
             &mut b,
-            SocketAddrV4::new(src, 5000),
-            SocketAddrV4::new(dst, 9000),
+            SocketAddrV4::new(src, sport),
+            SocketAddrV4::new(dst, 5000),
             1,
-            b"game",
+            &vec![1; len],
         )
         .unwrap();
         b.truncate(n);
@@ -590,7 +842,7 @@ mod tests {
         // Unconfirmed: nothing is sent to the client yet.
         assert!(!h.core.send_ip(0, 0, &udp(GAME, VIP), &mut h.io));
 
-        let ping = h.client_ping(7);
+        let ping = h.client_ping(0, 7);
         h.feed(1, addr(1000), &ping);
         let (_, to, pong) = h.io.sent.pop().unwrap();
         assert_eq!(to, addr(1000));
@@ -654,16 +906,22 @@ mod tests {
     fn roaming_client_is_followed() {
         let mut h = Harness::new();
         h.handshake(addr(1000));
-        let ping = h.client_ping(1);
+        let ping = h.client_ping(0, 1);
         h.feed(1, addr(1000), &ping);
-        // Client's NAT mapping changes.
-        let up = h.client_ip(&udp(VIP, GAME));
-        h.feed(2, addr(4000), &up);
-        assert_eq!(h.io.delivered.len(), 1);
+        // Client's NAT mapping changes; its PING re-registers path 0.
+        let ping = h.client_ping(0, 2);
+        h.feed(2, addr(4000), &ping);
         assert_eq!(h.core.stats.roamed, 1);
+        let up = h.client_ip(&udp(VIP, GAME));
+        h.feed(3, addr(4000), &up);
+        assert_eq!(h.io.delivered.len(), 1);
         h.io.sent.clear();
-        assert!(h.core.send_ip(3, 0, &udp(GAME, VIP), &mut h.io));
+        assert!(h.core.send_ip(4, 0, &udp(GAME, VIP), &mut h.io));
+        assert_eq!(h.io.sent.len(), 1);
         assert_eq!(h.io.sent[0].1, addr(4000));
+        let s = h.core.sessions[0].as_ref().unwrap();
+        assert_eq!(s.paths.len(), 1, "old mapping of path 0 dropped");
+        assert!(!h.core.by_addr.contains_key(&(0, addr(1000))));
     }
 
     #[test]
@@ -705,7 +963,7 @@ mod tests {
     fn sessions_expire() {
         let mut h = Harness::new();
         h.handshake(addr(1000));
-        h.core.tick(UNCONFIRMED_EXPIRE + 1);
+        h.core.tick(UNCONFIRMED_EXPIRE + 1, &mut h.io);
         assert_eq!(
             h.core.session_count(),
             0,
@@ -713,11 +971,11 @@ mod tests {
         );
 
         h.handshake(addr(1000));
-        let ping = h.client_ping(1);
+        let ping = h.client_ping(0, 1);
         h.feed(0, addr(1000), &ping);
-        h.core.tick(UNCONFIRMED_EXPIRE + 1);
+        h.core.tick(UNCONFIRMED_EXPIRE + 1, &mut h.io);
         assert_eq!(h.core.session_count(), 1);
-        h.core.tick(SERVER_SESSION_EXPIRE + 1);
+        h.core.tick(SERVER_SESSION_EXPIRE + 1, &mut h.io);
         assert_eq!(h.core.session_count(), 0);
     }
 
@@ -725,15 +983,120 @@ mod tests {
     fn close_frame_drops_session() {
         let mut h = Harness::new();
         h.handshake(addr(1000));
-        let close = h
-            .client
+        let close = h.client_control(&[Frame::Close(0)]);
+        h.feed(1, addr(1000), &close);
+        assert_eq!(h.core.session_count(), 0);
+    }
+
+    #[test]
+    fn paths_register_and_copies_spread_over_them() {
+        let mut h = Harness::new();
+        h.connect(2, 2, 0);
+        let s = h.core.sessions[0].as_ref().unwrap();
+        let ids: Vec<_> = s.paths.iter().map(|p| p.id).collect();
+        assert_eq!(ids, vec![Some(0), Some(1)]);
+
+        assert!(h.core.send_ip(2, 0, &udp(GAME, VIP), &mut h.io));
+        let to: Vec<_> = h.io.sent.iter().map(|s| s.1).collect();
+        assert_eq!(to, vec![addr(1000), addr(1001)]);
+        let sent = h.io.sent.clone();
+        assert!(h.client_open(&sent[1].2)[0].contains("copy: 1"));
+    }
+
+    #[test]
+    fn delayed_copies_wait_for_poll() {
+        let mut h = Harness::new();
+        h.connect(2, 2, 2000);
+        assert!(h.core.send_ip(10, 0, &udp(GAME, VIP), &mut h.io));
+        assert_eq!(h.io.sent.len(), 1);
+        assert_eq!(h.core.next_due(), Some(10 + 2 * MS));
+        h.core.poll(10 + 2 * MS - 1, &mut h.io);
+        assert_eq!(h.io.sent.len(), 1);
+        h.core.poll(10 + 2 * MS, &mut h.io);
+        assert_eq!(h.io.sent.len(), 2);
+        assert_eq!(h.io.sent[1].1, addr(1001));
+        assert_eq!(h.core.next_due(), None);
+        assert_eq!(h.core.sched_stats().copies_sent, 1);
+    }
+
+    #[test]
+    fn bulk_downloads_get_one_copy() {
+        let mut h = Harness::new();
+        h.connect(2, 2, 0);
+        let big = udp_sized(GAME, 443, VIP, 1200);
+        let mut t = 10;
+        for _ in 0..1200 {
+            h.core.send_ip(t, 0, &big, &mut h.io);
+            t += MS;
+        }
+        h.io.sent.clear();
+        h.core.send_ip(t, 0, &big, &mut h.io);
+        assert_eq!(h.io.sent.len(), 1);
+        assert!(h.core.stats.sent_bulk > 0);
+        h.core.send_ip(t, 0, &udp(GAME, VIP), &mut h.io);
+        assert_eq!(h.io.sent.len(), 3, "game flow still doubled");
+    }
+
+    #[test]
+    fn echo_is_answered_with_copies() {
+        let mut h = Harness::new();
+        h.connect(2, 2, 0);
+        let mut req = vec![];
+        h.client
             .tx
             .as_mut()
             .unwrap()
-            .control(|w| w.write(&Frame::Close(0)))
-            .unwrap()
-            .to_vec();
-        h.feed(1, addr(1000), &close);
-        assert_eq!(h.core.session_count(), 0);
+            .send_echo(
+                true,
+                Echo {
+                    seq: 0,
+                    copy: 0,
+                    id: 3,
+                    ts: 99,
+                    payload: b"xyz",
+                },
+                |p| req = p.to_vec(),
+            )
+            .unwrap();
+        h.feed(5, addr(1001), &req);
+        assert_eq!(h.io.sent.len(), 2);
+        let sent = h.io.sent.clone();
+        let f = h.client_open(&sent[0].2);
+        assert!(
+            f[0].starts_with("EchoResp") && f[0].contains("id: 3"),
+            "{f:?}"
+        );
+    }
+
+    #[test]
+    fn stats_report_paths_and_rtt_from_client_ranks_paths() {
+        let mut h = Harness::new();
+        h.connect(2, 1, 0);
+        // The client says path 1 is faster.
+        let mut st = Stats::new(0, 0, 0, 0);
+        for (path, srtt_us) in [(0u8, 160_000u32), (1, 150_000)] {
+            st.push_path(PathStats {
+                path,
+                tx_pkts: 0,
+                rx_pkts: 0,
+                srtt_us,
+                rttvar_us: 0,
+            });
+        }
+        let pkt = h.client_control(&[Frame::Stats(st)]);
+        h.feed(10, addr(1000), &pkt);
+        assert!(h.core.send_ip(20, 0, &udp(GAME, VIP), &mut h.io));
+        assert_eq!(h.io.sent.last().unwrap().1, addr(1001));
+
+        // Active session: STATS goes out on the next tick.
+        h.io.sent.clear();
+        h.core.tick(20 + STATS_ACTIVE, &mut h.io);
+        let sent = h.io.sent.clone();
+        assert_eq!(sent.len(), 1);
+        let f = h.client_open(&sent[0].2);
+        assert!(
+            f[0].starts_with("Stats") && f[0].contains("tx_unique: 1"),
+            "{f:?}"
+        );
     }
 }

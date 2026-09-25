@@ -18,8 +18,13 @@ public_key = "<node public key>"
 # psk = "<optional pre-shared key>"
 
 [tunnel]
-# mtu = 1400      # upper bound; the node's value wins if lower
+# paths = 2             # UDP sockets to the node (socket i uses ports[i % len])
+# copies = 2            # copies of each game packet, both directions (1 = off)
+# copy_delay_ms = 2.0   # gap between copies
+# mtu = 1400            # upper bound; the node's value wins if lower
 # pad_max = 48
+# bulk_enter_kbps = 2000  # flows faster than this for 1s get a single copy
+# bulk_exit_kbps = 1000   # ...until they stay below this for 5s
 
 # Executable names as shown in Task Manager's "Details" tab.
 [[game]]

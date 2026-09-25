@@ -7,7 +7,10 @@ use std::path::Path;
 use anyhow::{Context, Result, bail, ensure};
 use ipnet::Ipv4Net;
 use serde::Deserialize;
+use skyblock_proto::Micros;
+use skyblock_proto::frame::MAX_PATHS;
 use skyblock_proto::keys::{PrivateKey, Psk, PublicKey};
+use skyblock_proto::sched::{MAX_COPIES, MAX_COPY_DELAY, Policy};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -57,17 +60,68 @@ struct RawNode {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct TunnelConfig {
+    /// UDP sockets (paths) to the node; socket `i` uses `ports[i % len]`.
+    pub paths: usize,
+    /// Copies of each game packet, both directions (1 = no redundancy).
+    pub copies: u8,
+    /// Delay between successive copies.
+    pub copy_delay_ms: f64,
     /// Upper bound on the inner MTU; the node's value wins if lower.
     pub mtu: u16,
     pub pad_max: usize,
+    /// Flow classification thresholds (SPEC §4.1).
+    pub bulk_enter_kbps: u32,
+    pub bulk_exit_kbps: u32,
 }
 
 impl Default for TunnelConfig {
     fn default() -> Self {
         Self {
+            paths: 2,
+            copies: 2,
+            copy_delay_ms: 2.0,
             mtu: 1400,
             pad_max: skyblock_proto::packet::DATA_PAD_MAX,
+            bulk_enter_kbps: 2000,
+            bulk_exit_kbps: 1000,
         }
+    }
+}
+
+impl TunnelConfig {
+    pub fn policy(&self) -> Policy {
+        Policy {
+            copies: self.copies,
+            paths: 0,
+            copy_delay: (self.copy_delay_ms * 1000.0).round() as Micros,
+            bulk_enter_kbps: self.bulk_enter_kbps,
+            bulk_exit_kbps: self.bulk_exit_kbps,
+        }
+    }
+
+    fn validate(&self) -> Result<()> {
+        ensure!(
+            (576..=1432).contains(&self.mtu),
+            "`tunnel.mtu` must be within 576..=1432"
+        );
+        ensure!(
+            (1..=MAX_PATHS).contains(&self.paths),
+            "`tunnel.paths` must be within 1..={MAX_PATHS}"
+        );
+        ensure!(
+            (1..=MAX_COPIES).contains(&self.copies),
+            "`tunnel.copies` must be within 1..={MAX_COPIES}"
+        );
+        let max_delay = MAX_COPY_DELAY as f64 / 1000.0;
+        ensure!(
+            (0.0..=max_delay).contains(&self.copy_delay_ms),
+            "`tunnel.copy_delay_ms` must be within 0..={max_delay}"
+        );
+        ensure!(
+            self.bulk_exit_kbps <= self.bulk_enter_kbps && self.bulk_enter_kbps > 0,
+            "need 0 < `bulk_exit_kbps` <= `bulk_enter_kbps`"
+        );
+        Ok(())
     }
 }
 
@@ -135,10 +189,7 @@ impl Config {
 
     pub fn parse(text: &str) -> Result<Config> {
         let raw: RawConfig = toml::from_str(text)?;
-        ensure!(
-            (576..=1432).contains(&raw.tunnel.mtu),
-            "`tunnel.mtu` must be within 576..=1432"
-        );
+        raw.tunnel.validate()?;
         let mut names = HashSet::new();
         let mut nodes = Vec::with_capacity(raw.node.len());
         for n in raw.node {
@@ -269,5 +320,31 @@ mod tests {
         assert!(Config::parse(&format!("{}bogus = 1\n", base())).is_err());
         assert!(Config::parse(&format!("{}[tunnel]\nmtu = 100\n", base())).is_err());
         assert!(Config::parse(&format!("{}mode = \"magic\"\n", base())).is_err());
+        for bad in [
+            "paths = 0",
+            "paths = 9",
+            "copies = 0",
+            "copies = 5",
+            "copy_delay_ms = -1.0",
+            "copy_delay_ms = 51.0",
+            "bulk_enter_kbps = 100\nbulk_exit_kbps = 200",
+        ] {
+            let text = format!("{}[tunnel]\n{bad}\n", base());
+            assert!(Config::parse(&text).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn tunnel_policy() {
+        let text = format!(
+            "{}[tunnel]\npaths = 3\ncopies = 3\ncopy_delay_ms = 1.5\n",
+            base()
+        );
+        let c = Config::parse(&text).unwrap();
+        assert_eq!(c.tunnel.paths, 3);
+        let p = c.tunnel.policy();
+        assert_eq!((p.copies, p.copy_delay, p.paths), (3, 1500, 0));
+        let d = Config::parse(&base()).unwrap().tunnel;
+        assert_eq!((d.paths, d.copies, d.copy_delay_ms), (2, 2, 2.0));
     }
 }

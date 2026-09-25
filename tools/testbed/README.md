@@ -22,3 +22,22 @@ sudo tools/testbed/netns.sh down
 
 The client↔server link gets the netem profile on both directions; one-way
 delay defaults to 15ms (`SB_DELAY=25ms` to change).
+
+## Scenario scripts
+
+They take the directory holding `skyblock`, `skyblock-server` and `sbtest`
+(Linux builds, e.g. `target/x86_64-unknown-linux-musl/release`) and tear the
+testbed down on exit:
+
+| Script | Scenarios |
+|---|---|
+| `m1.sh` | S1 added latency, S9 full cone, S10 probe, S12 inner filter |
+| `m2.sh` | S2 random loss, S3 burst loss, S4 jitter/reorder, S5 path failure, S8 bulk + game |
+| `weak.sh` | W1 heavy loss, W2 large jitter, W3 heavy reordering, W4 all combined, W5 loss bursts, W6 one bad path, W7 short blackouts |
+
+`m2.sh` runs `skyblock bench` as a second user next to `up`;
+`SB_BENCH_SECS` sets the measured time per bench setting (default 20; 15 for `weak.sh`). `SB_CASES="W5 W7"` runs only those weak-network cases.
+
+Beyond the named profiles, `netns.sh netem custom "delay 30ms 20ms loss 10%"`
+applies arbitrary netem arguments, and `netns.sh pathem 40001 "<args>"`
+impairs only the tunnel path to node port 40001.

@@ -4,8 +4,8 @@
 use std::io;
 use std::net::SocketAddr;
 use std::ops::Range;
-use std::os::fd::AsRawFd;
-use std::time::{Duration, Instant};
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
+use std::time::Instant;
 
 use anyhow::{Context, Result};
 use mio::net::UdpSocket;
@@ -25,6 +25,7 @@ use crate::nat::{Nat, Outbound};
 use crate::setup;
 
 const TUN_TOKEN: Token = Token(1 << 15);
+const TIMER_TOKEN: Token = Token((1 << 15) + 1);
 const TICK: Micros = 100 * MS;
 const STATS_EVERY: Micros = 60 * SECOND;
 const BUF_LEN: usize = 65536;
@@ -125,16 +126,29 @@ pub fn run(cfg: Config) -> Result<()> {
 
     let start = Instant::now();
     let clock = || start.elapsed().as_micros() as Micros;
+    let timer = TimerFd::new().context("creating timerfd")?;
+    poll.registry().register(
+        &mut SourceFd(&timer.as_raw_fd()),
+        TIMER_TOKEN,
+        Interest::READABLE,
+    )?;
     let mut events = Events::with_capacity(256);
     let mut buf = vec![0u8; BUF_LEN];
     let mut scratch = vec![0u8; BUF_LEN];
     let mut out = vec![0u8; BUF_LEN];
     let mut deliveries = Deliveries::default();
     let (mut next_tick, mut next_stats) = (TICK, STATS_EVERY);
+    let mut armed: Option<Micros> = None;
 
     loop {
-        let timeout = Duration::from_micros(next_tick.saturating_sub(clock()));
-        if let Err(e) = poll.poll(&mut events, Some(timeout)) {
+        // One timer for housekeeping and delayed copies; epoll timeouts
+        // only have millisecond resolution.
+        let deadline = core.next_due().map_or(next_tick, |d| d.min(next_tick));
+        if armed != Some(deadline) {
+            timer.arm(deadline.saturating_sub(clock()));
+            armed = Some(deadline);
+        }
+        if let Err(e) = poll.poll(&mut events, None) {
             if e.kind() == io::ErrorKind::Interrupted {
                 continue;
             }
@@ -143,6 +157,10 @@ pub fn run(cfg: Config) -> Result<()> {
         let now = clock();
         for event in events.iter() {
             match event.token() {
+                TIMER_TOKEN => {
+                    timer.clear();
+                    armed = None;
+                }
                 TUN_TOKEN => loop {
                     let n = match tun.recv(&mut buf) {
                         Ok(n) => n,
@@ -194,8 +212,9 @@ pub fn run(cfg: Config) -> Result<()> {
                 }
             }
         }
+        core.poll(now, &mut SendOnly(&socks));
         if now >= next_tick {
-            core.tick(now);
+            core.tick(now, &mut SendOnly(&socks));
             nat.expire(now, poll.registry());
             next_tick = now + TICK;
         }
@@ -204,10 +223,68 @@ pub fn run(cfg: Config) -> Result<()> {
                 sessions = core.session_count(),
                 nat_mappings = nat.len(),
                 stats = ?core.stats,
+                sched = ?core.sched_stats(),
                 "stats"
             );
             next_stats = now + STATS_EVERY;
         }
+    }
+}
+
+/// A non-blocking one-shot `timerfd` on `CLOCK_MONOTONIC`.
+struct TimerFd(OwnedFd);
+
+impl TimerFd {
+    fn new() -> io::Result<Self> {
+        // SAFETY: plain syscall; the returned fd is owned below.
+        let fd = unsafe {
+            libc::timerfd_create(
+                libc::CLOCK_MONOTONIC,
+                libc::TFD_NONBLOCK | libc::TFD_CLOEXEC,
+            )
+        };
+        if fd < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: `fd` is a fresh descriptor nobody else owns.
+        Ok(Self(unsafe { OwnedFd::from_raw_fd(fd) }))
+    }
+
+    /// Fires once, `after` microseconds from now (at least 1µs: zero
+    /// would disarm it).
+    fn arm(&self, after: Micros) {
+        let after = after.max(1);
+        let spec = libc::itimerspec {
+            it_interval: libc::timespec {
+                tv_sec: 0,
+                tv_nsec: 0,
+            },
+            it_value: libc::timespec {
+                tv_sec: (after / SECOND) as _,
+                tv_nsec: ((after % SECOND) * 1000) as _,
+            },
+        };
+        // SAFETY: valid timerfd and itimerspec.
+        let r =
+            unsafe { libc::timerfd_settime(self.0.as_raw_fd(), 0, &spec, std::ptr::null_mut()) };
+        if r != 0 {
+            warn!("timerfd_settime: {}", io::Error::last_os_error());
+        }
+    }
+
+    /// Consumes the expiration count so the fd stops being readable.
+    fn clear(&self) {
+        let mut n = [0u8; 8];
+        // SAFETY: reading 8 bytes into a local buffer.
+        unsafe {
+            libc::read(self.0.as_raw_fd(), n.as_mut_ptr().cast(), n.len());
+        }
+    }
+}
+
+impl AsRawFd for TimerFd {
+    fn as_raw_fd(&self) -> RawFd {
+        self.0.as_raw_fd()
     }
 }
 

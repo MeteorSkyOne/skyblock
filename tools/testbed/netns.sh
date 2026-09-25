@@ -14,6 +14,8 @@
 # Usage:
 #   netns.sh up | down | status
 #   netns.sh netem <profile>        apply a link profile (see below)
+#   netns.sh netem custom "<args>"  apply arbitrary netem arguments
+#   netns.sh pathem <port> "<args>" impair only the tunnel path to node port <port>
 #   netns.sh exec <client|server|game> <cmd...>
 
 set -euo pipefail
@@ -89,7 +91,9 @@ netem() {
         burst) args="delay $DELAY loss gemodel 1% 30% 70% 0.1%" ;;
         jitter) args="delay $DELAY 5ms distribution normal" ;;
         reorder) args="delay $DELAY reorder 10% 50%" ;;
-        *) die "unknown profile '$profile' (clear|baseline|loss1|loss5|burst|jitter|reorder)" ;;
+        # Anything else: `netem custom "delay 30ms 20ms loss 10%"`.
+        custom) args=${2:?netem custom needs netem arguments} ;;
+        *) die "unknown profile '$profile' (clear|baseline|loss1|loss5|burst|jitter|reorder|custom ARGS)" ;;
     esac
     for ns in "$NS_CLIENT" "$NS_SERVER"; do
         in_ns "$ns" tc qdisc del dev wan0 root 2>/dev/null || true
@@ -97,6 +101,24 @@ netem() {
             # shellcheck disable=SC2086 # args is a word list on purpose
             in_ns "$ns" tc qdisc add dev wan0 root netem $args
         fi
+    done
+}
+
+# Impairs one tunnel path only: UDP to/from node port PORT gets netem ARGS,
+# everything else the baseline delay (both directions).
+pathem() {
+    local port=$1 args=$2 ns match
+    for ns in "$NS_CLIENT" "$NS_SERVER"; do
+        [[ $ns == "$NS_CLIENT" ]] && match=dport || match=sport
+        in_ns "$ns" tc qdisc del dev wan0 root 2>/dev/null || true
+        in_ns "$ns" tc qdisc add dev wan0 root handle 1: prio bands 3 \
+            priomap 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1
+        in_ns "$ns" tc qdisc add dev wan0 parent 1:1 handle 10: netem delay "$DELAY"
+        in_ns "$ns" tc qdisc add dev wan0 parent 1:2 handle 20: netem delay "$DELAY"
+        # shellcheck disable=SC2086 # args is a word list on purpose
+        in_ns "$ns" tc qdisc add dev wan0 parent 1:3 handle 30: netem $args
+        in_ns "$ns" tc filter add dev wan0 parent 1: protocol ip prio 1 u32 \
+            match ip protocol 17 0xff match ip "$match" "$port" 0xffff flowid 1:3
     done
 }
 
@@ -114,7 +136,11 @@ case "${1:-}" in
     status) status ;;
     netem)
         [[ $# -ge 2 ]] || die "usage: netns.sh netem <profile>"
-        netem "$2"
+        netem "$2" "${3:-}"
+        ;;
+    pathem)
+        [[ $# -ge 3 ]] || die "usage: netns.sh pathem <node port> <netem args>"
+        pathem "$2" "$3"
         ;;
     exec)
         [[ $# -ge 3 ]] || die "usage: netns.sh exec <client|server|game> <cmd...>"
@@ -122,5 +148,5 @@ case "${1:-}" in
         shift 2
         in_ns "$ns" "$@"
         ;;
-    *) die "usage: netns.sh up|down|status|netem <profile>|exec <ns> <cmd...>" ;;
+    *) die "usage: netns.sh up|down|status|netem <profile> [args]|pathem <port> <args>|exec <ns> <cmd...>" ;;
 esac

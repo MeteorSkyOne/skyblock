@@ -1,3 +1,4 @@
+mod bench;
 mod capture;
 mod config;
 mod core;
@@ -6,6 +7,7 @@ mod core;
 mod flows;
 #[cfg(windows)]
 mod procmap;
+mod report;
 mod tunnel;
 #[cfg(windows)]
 mod windivert;
@@ -20,9 +22,11 @@ use clap::{Parser, Subcommand};
 use skyblock_proto::keys::PrivateKey;
 use tracing::{Level, info};
 
+use crate::bench::BenchArgs;
 use crate::capture::Capture;
 use crate::config::{Config, GameConfig, Mode};
-use crate::core::ClientCore;
+use crate::core::{ClientCore, Snapshot};
+use crate::report::{Interval, pct};
 use crate::tunnel::Tunnel;
 
 /// skyblock game accelerator client.
@@ -55,6 +59,35 @@ enum Command {
         #[arg(long, value_parser = parse_mode)]
         mode: Option<Mode>,
     },
+    /// Measure loss and latency through a node for several redundancy
+    /// settings. Replaces a running `up` session with the same key.
+    Bench {
+        #[arg(short, long, default_value = "skyblock.toml")]
+        config: PathBuf,
+        #[arg(long)]
+        node: Option<String>,
+        /// Measured time per setting, e.g. 30s, 2m.
+        #[arg(long, default_value = "30s", value_parser = parse_duration)]
+        duration: Duration,
+        /// Unmeasured traffic before each setting.
+        #[arg(long, default_value = "2s", value_parser = parse_duration)]
+        warmup: Duration,
+        /// Echo requests per second.
+        #[arg(long, default_value_t = 128)]
+        pps: u32,
+        /// Payload size or range in bytes, e.g. 200 or 100-300.
+        #[arg(long, default_value = "100-300", value_parser = parse_size)]
+        size: (usize, usize),
+        /// Copy counts to try.
+        #[arg(long, value_delimiter = ',', default_value = "1,2")]
+        copies: Vec<u8>,
+        /// Path counts to try (copies spread over this many best paths).
+        #[arg(long, value_delimiter = ',', default_value = "2")]
+        paths: Vec<u8>,
+        /// Copy delays to try, in ms (default: from the config).
+        #[arg(long = "delay-ms", value_delimiter = ',')]
+        delays_ms: Vec<f64>,
+    },
 }
 
 fn parse_mode(s: &str) -> Result<Mode, String> {
@@ -63,6 +96,38 @@ fn parse_mode(s: &str) -> Result<Mode, String> {
         "tun" => Ok(Mode::Tun),
         _ => Err("expected `windivert` or `tun`".into()),
     }
+}
+
+fn parse_duration(s: &str) -> Result<Duration, String> {
+    let (num, unit) = s
+        .find(|c: char| c.is_ascii_alphabetic())
+        .map_or((s, "s"), |i| (&s[..i], &s[i..]));
+    let v: f64 = num.parse().map_err(|_| format!("bad duration `{s}`"))?;
+    let secs = match unit {
+        "ms" => v / 1000.0,
+        "s" => v,
+        "m" => v * 60.0,
+        _ => return Err(format!("bad duration unit in `{s}` (ms, s, m)")),
+    };
+    if !(secs > 0.0 && secs < 86_400.0) {
+        return Err(format!("duration `{s}` out of range"));
+    }
+    Ok(Duration::from_secs_f64(secs))
+}
+
+fn parse_size(s: &str) -> Result<(usize, usize), String> {
+    let bad = || format!("bad size `{s}` (e.g. 200 or 100-300)");
+    let (lo, hi) = match s.split_once('-') {
+        Some((a, b)) => (a.parse().map_err(|_| bad())?, b.parse().map_err(|_| bad())?),
+        None => {
+            let v = s.parse().map_err(|_| bad())?;
+            (v, v)
+        }
+    };
+    if lo > hi || hi > 1200 {
+        return Err(format!("size `{s}` must be ascending and at most 1200"));
+    }
+    Ok((lo, hi))
 }
 
 fn main() -> Result<()> {
@@ -85,6 +150,41 @@ fn main() -> Result<()> {
             games,
             mode,
         } => up(&config, node.as_deref(), &games, mode),
+        Command::Bench {
+            config,
+            node,
+            duration,
+            warmup,
+            pps,
+            size,
+            copies,
+            paths,
+            delays_ms,
+        } => {
+            let cfg = Config::load(&config)?;
+            let node = cfg.node(node.as_deref())?.clone();
+            if pps == 0 || pps > 5000 {
+                bail!("--pps must be within 1..=5000");
+            }
+            if copies.iter().any(|&c| c == 0 || c > 4) || paths.iter().any(|&p| p == 0 || p > 8) {
+                bail!("--copies must be within 1..=4 and --paths within 1..=8");
+            }
+            let delays_ms = if delays_ms.is_empty() {
+                vec![cfg.tunnel.copy_delay_ms]
+            } else {
+                delays_ms
+            };
+            let args = BenchArgs {
+                duration,
+                warmup,
+                pps,
+                size,
+                copies,
+                paths,
+                delays_ms,
+            };
+            bench::run(&cfg, &node, &args)
+        }
     }
 }
 
@@ -104,9 +204,19 @@ fn up(
         node.public_key,
         node.psk,
         cfg.tunnel.pad_max,
+        cfg.tunnel.paths,
+        cfg.tunnel.policy(),
     );
-    info!(node = %node.name, addr = %node.addr, port = node.ports[0], "connecting");
-    let tunnel = Tunnel::start(core, &node)?;
+    info!(
+        node = %node.name,
+        addr = %node.addr,
+        ports = ?node.ports,
+        paths = cfg.tunnel.paths,
+        copies = cfg.tunnel.copies,
+        copy_delay_ms = cfg.tunnel.copy_delay_ms,
+        "connecting"
+    );
+    let tunnel = Tunnel::start(core, &node, cfg.tunnel.paths)?;
     let hello = tunnel.wait_connected();
     let mtu = hello.mtu.min(cfg.tunnel.mtu);
 
@@ -166,21 +276,96 @@ fn open_capture(
     }
 }
 
+/// Loss figures carried over between STATS exchanges.
+#[derive(Default)]
+struct EffLoss {
+    up: Option<f64>,
+    down: Option<f64>,
+    up_rescued: u64,
+    down_rescued: u64,
+}
+
 fn status_loop(tunnel: &Tunnel, node: &str) -> Result<()> {
-    let ms = |us: u64| us as f64 / 1000.0;
-    let mut prev = tunnel.stats().0;
+    let mut prev = tunnel.snapshot();
+    let mut eff = EffLoss::default();
     loop {
         std::thread::sleep(Duration::from_secs(1));
-        let (s, hello) = tunnel.stats();
-        let state = if hello.is_some() { "up" } else { "connecting" };
-        println!(
-            "[{node}] {state} | rtt {:.1}ms min {:.1}ms | up {} pkt/s down {} pkt/s | sessions {}",
-            ms(s.rtt.srtt),
-            ms(s.rtt.min),
-            s.tx_data - prev.tx_data,
-            s.rx_data - prev.rx_data,
-            s.handshakes,
-        );
-        prev = s;
+        let cur = tunnel.snapshot();
+        if let (Some(a), Some(b)) = (&prev.exchange, &cur.exchange) {
+            if b.at != a.at {
+                let i = Interval { a, b };
+                eff = EffLoss {
+                    up: i.up_eff(),
+                    down: i.down_eff(),
+                    up_rescued: i.up_rescued(),
+                    down_rescued: i.down_rescued(),
+                };
+            }
+        }
+        println!("{}", status_line(node, &prev, &cur, &eff));
+        prev = cur;
+    }
+}
+
+/// e.g. `[tokyo-1] up | rtt 42.1ms ±0.3 | loss up 0.8%/0.00% down 0.5%/0.00% rescued 3/2
+/// | up 128pps 0.2Mbps down 128pps 0.3Mbps | paths 2/2 [42.1 43.0] | flows 3 bulk 1`
+fn status_line(node: &str, prev: &Snapshot, cur: &Snapshot, eff: &EffLoss) -> String {
+    if !cur.connected {
+        return format!("[{node}] connecting");
+    }
+    let ms = |us: u64| us as f64 / 1000.0;
+    let up: Vec<_> = cur.paths.iter().filter(|p| p.up).collect();
+    let avg = |f: fn(&&crate::core::PathView) -> f32| -> Option<f64> {
+        (!up.is_empty()).then(|| up.iter().map(f).sum::<f32>() as f64 / up.len() as f64)
+    };
+    let (rtt, var) = cur
+        .best
+        .and_then(|b| cur.paths.get(b))
+        .map_or((0, 0), |p| (p.rtt.srtt, p.rtt.rttvar));
+    let (s, p) = (&cur.stats, &prev.stats);
+    let mbps = |bytes: u64| bytes as f64 * 8.0 / 1e6;
+    let rtts: Vec<String> = cur
+        .paths
+        .iter()
+        .map(|p| format!("{:.1}", ms(p.rtt.srtt)))
+        .collect();
+    format!(
+        "[{node}] up | rtt {:.1}ms ±{:.1} | loss up {}/{} down {}/{} rescued {}/{} | up {}pps {:.1}Mbps down {}pps {:.1}Mbps | paths {}/{} [{}] | flows {} bulk {}",
+        ms(rtt),
+        ms(var),
+        pct(avg(|p| p.loss_out)),
+        pct(eff.up),
+        pct(avg(|p| p.loss_in)),
+        pct(eff.down),
+        eff.up_rescued,
+        eff.down_rescued,
+        s.tx_ip.saturating_sub(p.tx_ip),
+        mbps(s.tx_bytes.saturating_sub(p.tx_bytes)),
+        s.rx_ip.saturating_sub(p.rx_ip),
+        mbps(s.rx_bytes.saturating_sub(p.rx_bytes)),
+        up.len(),
+        cur.paths.len(),
+        rtts.join(" "),
+        cur.flows,
+        cur.bulk_flows,
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn durations_and_sizes() {
+        assert_eq!(parse_duration("30s"), Ok(Duration::from_secs(30)));
+        assert_eq!(parse_duration("2m"), Ok(Duration::from_secs(120)));
+        assert_eq!(parse_duration("500ms"), Ok(Duration::from_millis(500)));
+        assert_eq!(parse_duration("10"), Ok(Duration::from_secs(10)));
+        assert!(parse_duration("0s").is_err());
+        assert!(parse_duration("5h").is_err());
+        assert_eq!(parse_size("100-300"), Ok((100, 300)));
+        assert_eq!(parse_size("200"), Ok((200, 200)));
+        assert!(parse_size("300-100").is_err());
+        assert!(parse_size("2000").is_err());
     }
 }

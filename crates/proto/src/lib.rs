@@ -4,13 +4,16 @@
 
 pub mod dedup;
 mod error;
+pub mod flow;
 pub mod frag;
 pub mod frame;
 pub mod handshake;
 pub mod ip;
 pub mod keys;
 pub mod packet;
+pub mod path;
 pub mod replay;
+pub mod sched;
 pub mod session;
 pub mod timing;
 

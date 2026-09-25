@@ -213,6 +213,8 @@ impl WinDivertCapture {
     }
 
     fn capture_loop(&self, sink: Sink, hold: Sender<Held>) {
+        let boost = skyblock_sys::prio::boost_current_thread();
+        debug!(?boost, "capture thread");
         let mut buf = vec![0u8; 65536];
         let mut addr = Address::default();
         loop {
