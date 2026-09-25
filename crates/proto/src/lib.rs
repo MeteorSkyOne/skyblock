@@ -11,6 +11,8 @@ pub mod ip;
 pub mod keys;
 pub mod packet;
 pub mod replay;
+pub mod session;
+pub mod timing;
 
 pub use error::Error;
 

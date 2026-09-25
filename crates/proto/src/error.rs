@@ -6,6 +6,8 @@ pub enum Error {
     Truncated,
     #[error("authentication failed")]
     Auth,
+    #[error("replayed packet")]
+    Replay,
     #[error("malformed frame")]
     MalformedFrame,
     #[error("unknown frame type {0:#04x}")]

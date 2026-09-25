@@ -1,0 +1,14 @@
+[package]
+name = "skyblock-testkit"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+
+[[bin]]
+name = "sbtest"
+path = "src/main.rs"
+
+[dependencies]
+clap.workspace = true
+rand.workspace = true

@@ -236,6 +236,39 @@ impl<B: AsRef<[u8]> + AsMut<[u8]>> Ipv4Packet<B> {
             _ => {}
         }
     }
+
+    /// Recomputes the IPv4 header checksum and, for unfragmented TCP/UDP,
+    /// the transport checksum from scratch. Needed for packets captured on
+    /// the send path, whose checksums may be left to NIC offload.
+    pub fn recompute_checksums(&mut self) {
+        let (hl, total, proto, fragmented) = (
+            self.header_len,
+            self.total_len,
+            self.protocol(),
+            self.is_fragment(),
+        );
+        let (src, dst) = (self.src(), self.dst());
+        let b = self.buf.as_mut();
+        b[10..12].fill(0);
+        let c = checksum(&b[..hl]);
+        b[10..12].copy_from_slice(&c.to_be_bytes());
+        if fragmented {
+            // The transport checksum covers the whole datagram.
+            return;
+        }
+        let seg = &mut b[hl..total];
+        let field = match proto {
+            PROTO_TCP if seg.len() >= TCP_HEADER_LEN => 16,
+            PROTO_UDP if seg.len() >= UDP_HEADER_LEN => 6,
+            _ => return,
+        };
+        seg[field..field + 2].fill(0);
+        let mut c = transport_checksum(src, dst, proto, seg);
+        if proto == PROTO_UDP && c == 0 {
+            c = 0xffff;
+        }
+        seg[field..field + 2].copy_from_slice(&c.to_be_bytes());
+    }
 }
 
 /// Writes an IPv4/UDP datagram into `out` and returns its length.
@@ -530,6 +563,21 @@ mod tests {
         let mut p = tcp_syn(LAN, REMOTE, 1460);
         p[41] = 200; // length past the header
         assert!(!Ipv4Packet::parse(&mut p[..]).unwrap().clamp_mss(1000));
+    }
+
+    #[test]
+    fn recompute_fixes_offloaded_checksums() {
+        // Simulate NIC offload: transport checksum holds garbage.
+        let mut p = tcp_syn(LAN, REMOTE, 1460);
+        p[36..38].copy_from_slice(&[0x12, 0x34]);
+        p[10..12].copy_from_slice(&[0, 0]);
+        Ipv4Packet::parse(&mut p[..]).unwrap().recompute_checksums();
+        assert_eq!(p, tcp_syn(LAN, REMOTE, 1460));
+
+        let mut p = udp(LAN, REMOTE, b"offloaded");
+        p[26..28].copy_from_slice(&[0xab, 0xcd]);
+        Ipv4Packet::parse(&mut p[..]).unwrap().recompute_checksums();
+        assert_valid(&p);
     }
 
     #[test]

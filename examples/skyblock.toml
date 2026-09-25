@@ -1,0 +1,31 @@
+# skyblock client configuration (SPEC §6.8).
+# Put this file next to skyblock.exe (or pass -c <path>).
+
+# From `skyblock keygen`; give the printed public key to each node's
+# `skyblock-server adduser`.
+private_key = "<your private key>"
+
+# windivert (Windows, per-process) | tun (Linux testbed)
+# mode = "windivert"
+# default_node = "tokyo-1"
+
+# Paste the block printed by `skyblock-server adduser` for each node.
+[[node]]
+name = "tokyo-1"
+addr = "203.0.113.10"
+ports = [40001, 40002]
+public_key = "<node public key>"
+# psk = "<optional pre-shared key>"
+
+[tunnel]
+# mtu = 1400      # upper bound; the node's value wins if lower
+# pad_max = 48
+
+# Executable names as shown in Task Manager's "Details" tab.
+[[game]]
+name = "cs2"
+process = ["cs2.exe"]
+
+[[game]]
+name = "valorant"
+process = ["VALORANT-Win64-Shipping.exe"]
