@@ -7,13 +7,15 @@
 use rand::rngs::StdRng;
 use rand::{RngExt, SeedableRng};
 use skyblock_proto::Micros;
+use skyblock_proto::adapt::AdaptiveCopies;
 use skyblock_proto::flow::{Class, FlowClassifier, FlowKey};
 use skyblock_proto::frame::{
-    Frame, FrameReader, MAX_PATHS, PathStats, Ping, Pong, ProbeReq, ProbeResp, Stats,
+    Frame, FrameReader, MAX_PATHS, NackRange, PathStats, Ping, Pong, ProbeReq, ProbeResp, Stats,
 };
 use skyblock_proto::handshake::{ClientHello, Initiator, MAX_MSG_LEN, ServerHello, next_timestamp};
 use skyblock_proto::ip::Ipv4Packet;
 use skyblock_proto::keys::{PrivateKey, Psk, PublicKey, SessionKeys};
+use skyblock_proto::nack;
 use skyblock_proto::packet::PacketBuf;
 use skyblock_proto::path::{PathMetrics, Ranking, Rtt, down_after};
 use skyblock_proto::sched::{Plan, Policy, Scheduler};
@@ -69,6 +71,9 @@ pub struct ClientStats {
     /// Handshakes started beside a session that went silent while data
     /// flowed (the node may have restarted).
     pub resumes: u64,
+    /// NACK frames sent, and items resent for the node's NACKs.
+    pub nacks: u64,
+    pub retransmits: u64,
 }
 
 /// A `STATS` frame from the node, with our own counters as they were when
@@ -112,6 +117,8 @@ pub struct Snapshot {
     pub flows: usize,
     pub bulk_flows: usize,
     pub exchange: Option<Exchange>,
+    /// Copies in use, (up, down).
+    pub copies: (u8, u8),
 }
 
 struct Handshake {
@@ -204,7 +211,15 @@ pub struct ClientCore {
     ping_id: u32,
     rng: StdRng,
     hs_buf: PacketBuf,
+    /// Adaptive copy counts (up, down); `None`: `policy.copies` both ways.
+    adapt: Option<(AdaptiveCopies, AdaptiveCopies)>,
+    nack_buf: Vec<NackRange>,
     pub stats: ClientStats,
+}
+
+/// How long a gap may stay open before it is NACKed, if NACKs are on.
+fn nack_wait(p: &Policy) -> Option<Micros> {
+    p.nack.then(|| nack::wait_for(p.copy_delay))
 }
 
 impl ClientCore {
@@ -232,6 +247,8 @@ impl ClientCore {
             ping_id: 0,
             rng: StdRng::from_rng(&mut rand::rng()),
             hs_buf: PacketBuf::new(),
+            adapt: None,
+            nack_buf: Vec::new(),
             stats: ClientStats::default(),
         }
     }
@@ -240,6 +257,35 @@ impl ClientCore {
     pub fn with_rekey_interval(mut self, interval: Option<Micros>) -> Self {
         self.rekey_interval = interval;
         self
+    }
+
+    /// Lets each direction's copy count follow its loss, between
+    /// `policy.copies` and `ceil` (SPEC §4.5).
+    pub fn with_adaptive_copies(mut self, ceil: u8) -> Self {
+        self.adapt = Self::adaptive(self.policy.copies, ceil);
+        self
+    }
+
+    /// Copies in use, (up, down).
+    pub fn copies(&self) -> (u8, u8) {
+        match &self.adapt {
+            Some((up, down)) => (up.current(), down.current()),
+            None => (self.policy.copies, self.policy.copies),
+        }
+    }
+
+    fn up_policy(&self) -> Policy {
+        Policy {
+            copies: self.copies().0,
+            ..self.policy
+        }
+    }
+
+    fn down_policy(&self) -> Policy {
+        Policy {
+            copies: self.copies().1,
+            ..self.policy
+        }
     }
 
     pub fn hello(&self) -> Option<ServerHello> {
@@ -285,9 +331,13 @@ impl ClientCore {
     /// it from the `TUNE` sent with a PING on every path.
     pub fn set_policy(&mut self, now: Micros, policy: Policy, io: &mut impl ClientIo) {
         self.policy = policy;
+        if let Some(ceil) = self.adapt.as_ref().map(|(up, _)| up.ceil()) {
+            self.adapt = Self::adaptive(policy.copies, ceil);
+        }
         if let Some(s) = &mut self.session {
             s.flows
                 .set_thresholds(policy.bulk_enter_kbps, policy.bulk_exit_kbps);
+            s.rx.set_nack_wait(nack_wait(&policy));
         }
         for p in 0..self.n_paths {
             self.send_ping(now, p, io);
@@ -339,6 +389,7 @@ impl ClientCore {
                 io.send(path, pkt);
             });
         }
+        self.poll_nacks(now, io);
         for p in 0..self.n_paths {
             let due = self.session.as_ref().is_some_and(|s| now >= s.next_ping[p]);
             if due {
@@ -362,6 +413,39 @@ impl ClientCore {
             .min(dead_at)
             .min(resume_at)
             .min(now + MAX_POLL)
+    }
+
+    fn adaptive(floor: u8, ceil: u8) -> Option<(AdaptiveCopies, AdaptiveCopies)> {
+        (ceil > floor).then(|| {
+            (
+                AdaptiveCopies::new(floor, ceil),
+                AdaptiveCopies::new(floor, ceil),
+            )
+        })
+    }
+
+    /// Sends a NACK for the downlink gaps that are due (best path).
+    fn poll_nacks(&mut self, now: Micros, io: &mut impl ClientIo) {
+        let ClientCore {
+            session,
+            nack_buf,
+            stats,
+            ..
+        } = self;
+        let Some(s) = session else { return };
+        if s.rx.next_nack().is_none_or(|d| d > now) {
+            return;
+        }
+        s.rx.nacks(now, nack_buf);
+        if nack_buf.is_empty() {
+            return;
+        }
+        let path = s.ranking.best().unwrap_or(0);
+        if let Ok(out) = s.tx.control(|w| w.nack(nack_buf)) {
+            io.send(path, out);
+            s.paths[path].tx_pkts += 1;
+            stats.nacks += 1;
+        }
     }
 
     /// While data flows and nothing has come from the node for
@@ -409,6 +493,7 @@ impl ClientCore {
         let s = self.session.as_ref()?;
         let ping = s.next_ping.iter().copied().min().unwrap_or(Micros::MAX);
         let t = ping.min(s.next_stats);
+        let t = s.rx.next_nack().map_or(t, |d| d.min(t));
         Some(s.sched.next_due().map_or(t, |d| d.min(t)))
     }
 
@@ -425,8 +510,10 @@ impl ClientCore {
             session,
             stats,
             rekey_interval,
+            adapt,
             ..
         } = self;
+        let mut retune = false;
         if let Some(s) = session {
             if let Ok((body, phase)) = s.rx.open(now, pkt) {
                 if phase == KeyPhase::Next {
@@ -483,7 +570,29 @@ impl ClientCore {
                                 m.tx_pkts += 1;
                             }
                         }
-                        Frame::Stats(st) => on_node_stats(s, now, st),
+                        Frame::Stats(st) => {
+                            let counts = s.exchange.as_ref().map(|prev| interval(prev, s, &st));
+                            on_node_stats(s, now, st);
+                            if let (Some(c), Some((up, down))) = (counts, adapt.as_mut()) {
+                                let before = down.current();
+                                up.update(now, c.up_sent, c.up_lost);
+                                retune |= down.update(now, c.down_sent, c.down_lost) != before;
+                            }
+                        }
+                        Frame::Nack(n) => {
+                            let Session {
+                                tx,
+                                sched,
+                                paths,
+                                ranking,
+                                ..
+                            } = &mut *s;
+                            let sent = sched.on_nack(tx, now, n.ranges(), ranking, |path, pkt| {
+                                paths[path].tx_pkts += 1;
+                                io.send(path, pkt);
+                            });
+                            stats.retransmits += sent as u64;
+                        }
                         Frame::Close(_) => close = true,
                         _ => match s.rx.accept(now, &frame) {
                             Some(Data::Ip(ip)) => {
@@ -504,6 +613,12 @@ impl ClientCore {
                     warn!("node closed the session; reconnecting");
                     *session = None;
                 }
+                if retune {
+                    // The node learns the new downlink copy count from the
+                    // TUNE that goes with every PING.
+                    debug!(copies = ?self.copies(), "adaptive copies");
+                    self.ping_all(now, io);
+                }
                 return;
             }
         }
@@ -513,6 +628,7 @@ impl ClientCore {
     /// Sends an inner packet with the redundancy its flow gets; returns
     /// `false` when there is no session.
     pub fn send_ip(&mut self, now: Micros, ip: &[u8], io: &mut impl ClientIo) -> bool {
+        let policy = self.up_policy();
         let Some(s) = &mut self.session else {
             return false;
         };
@@ -526,7 +642,7 @@ impl ClientCore {
         if flow.class == Class::Bulk {
             self.stats.tx_bulk += 1;
         }
-        let plan = Plan::for_flow(&self.policy, flow);
+        let plan = Plan::for_flow(&policy, flow);
         let Session {
             tx,
             sched,
@@ -551,11 +667,11 @@ impl ClientCore {
         payload: &[u8],
         io: &mut impl ClientIo,
     ) -> bool {
+        let plan = Plan::redundant(&self.up_policy());
         let Some(s) = &mut self.session else {
             return false;
         };
         s.touch(now);
-        let plan = Plan::redundant(&self.policy);
         let Session {
             tx,
             sched,
@@ -605,6 +721,7 @@ impl ClientCore {
                 flows: 0,
                 bulk_flows: 0,
                 exchange: None,
+                copies: self.copies(),
             };
         };
         Snapshot {
@@ -624,6 +741,7 @@ impl ClientCore {
             flows: s.flows.len(),
             bulk_flows: s.flows.bulk_count(),
             exchange: s.exchange,
+            copies: self.copies(),
         }
     }
 
@@ -690,6 +808,7 @@ impl ClientCore {
                 });
                 if let Some(s) = &mut self.session {
                     s.ranking.update(now, down_after(false), s.paths.iter());
+                    s.rx.set_nack_wait(nack_wait(&self.policy));
                 }
                 self.stats.handshakes += 1;
                 info!(vip = %hello.vip, mtu = hello.mtu, paths = self.n_paths, replaced, "connected");
@@ -822,6 +941,7 @@ impl ClientCore {
     /// PINGs `path`, with the current `TUNE` alongside so the node always
     /// has our policy.
     fn send_ping(&mut self, now: Micros, path: usize, io: &mut impl ClientIo) {
+        let tune = Frame::Tune(self.down_policy().to_tune());
         let Some(s) = &mut self.session else { return };
         self.ping_id = self.ping_id.wrapping_add(1);
         let ping = Frame::Ping(Ping {
@@ -829,7 +949,6 @@ impl ClientCore {
             id: self.ping_id,
             ts: now,
         });
-        let tune = Frame::Tune(self.policy.to_tune());
         if let Ok(out) = s.tx.control(|w| {
             w.write(&ping)?;
             w.write(&tune)
@@ -880,6 +999,42 @@ fn send_stats(s: &mut Session, now: Micros, io: &mut impl ClientIo) {
 /// Microseconds for a `STATS` field (0 while unmeasured).
 fn clamp_u32(us: Micros) -> u32 {
     us.min(Micros::from(u32::MAX)) as u32
+}
+
+/// Raw packet counts between two STATS exchanges, all paths together.
+struct Interval {
+    up_sent: u64,
+    up_lost: i64,
+    down_sent: u64,
+    down_lost: i64,
+}
+
+/// What happened on the paths since `prev`, from our counters now and the
+/// node's in `st` (SPEC §4.4). Packets in flight make single intervals
+/// err either way; the adaptive window sums them out.
+fn interval(prev: &Exchange, s: &Session, st: &Stats) -> Interval {
+    let mut c = Interval {
+        up_sent: 0,
+        up_lost: 0,
+        down_sent: 0,
+        down_lost: 0,
+    };
+    for p in st.paths() {
+        let i = usize::from(p.path);
+        let (Some(m), Some((peer_tx0, peer_rx0))) = (s.paths.get(i), prev.peer_path(i)) else {
+            continue;
+        };
+        let (my_tx0, my_rx0) = prev.paths[i];
+        let up_sent = m.tx_pkts.saturating_sub(my_tx0);
+        let up_recv = p.rx_pkts.saturating_sub(peer_rx0);
+        let down_sent = p.tx_pkts.saturating_sub(peer_tx0);
+        let down_recv = m.rx_pkts.saturating_sub(my_rx0);
+        c.up_sent += up_sent;
+        c.up_lost += up_sent as i64 - up_recv as i64;
+        c.down_sent += down_sent;
+        c.down_lost += down_sent as i64 - down_recv as i64;
+    }
+    c
 }
 
 fn on_node_stats(s: &mut Session, now: Micros, st: Stats) {
@@ -1278,6 +1433,103 @@ mod tests {
         assert_eq!(ex.rx.unique, 1);
         assert_eq!(ex.peer_path(1), Some((2, 3)));
         assert_eq!(ex.paths[1].1, 2, "two packets received on path 1");
+    }
+
+    fn node_stats(tx_pkts: u64, rx_pkts: u64) -> Frame<'static> {
+        let mut st = Stats::new(0, 0, 0, 0);
+        st.push_path(PathStats {
+            path: 0,
+            tx_pkts,
+            rx_pkts,
+            srtt_us: 0,
+            rttvar_us: 0,
+        });
+        Frame::Stats(st)
+    }
+
+    #[test]
+    fn downlink_loss_raises_the_node_copies() {
+        let (core, mut node, mut io) = setup_with(1, game(2, 0));
+        let mut core = core.with_adaptive_copies(3);
+        connect(&mut core, &mut node, &mut io);
+        assert_eq!(core.copies(), (2, 2));
+        let mut st = node.control(&node_stats(0, 1000));
+        core.handle_datagram(SECOND, 0, &mut st, &mut io);
+        io.sent.clear();
+        // The node says it sent 300 packets; 1 arrived (this STATS).
+        let mut st = node.control(&node_stats(300, 1000));
+        core.handle_datagram(2 * SECOND, 0, &mut st, &mut io);
+        assert_eq!(core.copies(), (2, 3), "few packets up: no change there");
+        let tunes: Vec<_> = io
+            .sent
+            .iter()
+            .map(|(_, p)| node.frames(p))
+            .filter(|f| f.iter().any(|f| f.starts_with("Tune")))
+            .collect();
+        assert!(!tunes.is_empty(), "TUNE right away");
+        assert!(
+            tunes.iter().all(|f| f[1].contains("copies: 3")),
+            "{tunes:?}"
+        );
+        assert_eq!(core.snapshot(2 * SECOND).copies, (2, 3));
+    }
+
+    #[test]
+    fn nacks_both_ways() {
+        let p = Policy {
+            nack: true,
+            ..game(1, 0)
+        };
+        let (mut core, mut node, mut io) = setup_with(1, p);
+        connect(&mut core, &mut node, &mut io);
+        // Down: seq 1 is lost; 5ms after 2 arrives, the client NACKs it.
+        let mut pkts = vec![];
+        for _ in 0..3 {
+            node.tx
+                .as_mut()
+                .unwrap()
+                .send_ip(&udp(9000, 20), |p| pkts.push(p.to_vec()))
+                .unwrap();
+        }
+        core.handle_datagram(10_000, 0, &mut pkts[0], &mut io);
+        core.handle_datagram(11_000, 0, &mut pkts[2], &mut io);
+        io.sent.clear();
+        core.poll(11_000 + 5 * MS - 1, &mut io);
+        assert!(
+            io.sent
+                .iter()
+                .all(|(_, p)| !node.frames(p)[0].starts_with("Nack"))
+        );
+        io.sent.clear();
+        core.poll(11_000 + 5 * MS, &mut io);
+        let nacks: Vec<_> = io
+            .sent
+            .iter()
+            .map(|(_, p)| node.frames(p))
+            .filter(|f| f[0].starts_with("Nack"))
+            .collect();
+        assert_eq!(nacks.len(), 1);
+        assert_eq!(core.stats.nacks, 1);
+
+        // Up: the node NACKs seq 1; the client resends it once.
+        io.sent.clear();
+        for _ in 0..3 {
+            core.send_ip(20_000, &udp(5000, 10), &mut io);
+        }
+        io.sent.clear();
+        let nack = [NackRange { start: 1, count: 1 }];
+        let mut pkt = node
+            .tx
+            .as_mut()
+            .unwrap()
+            .control(|w| w.nack(&nack))
+            .unwrap()
+            .to_vec();
+        core.handle_datagram(21_000, 0, &mut pkt, &mut io);
+        assert_eq!(io.sent.len(), 1);
+        let f = node.frames(&io.sent[0].1);
+        assert!(f[0].starts_with("Ip(Ip { seq: 1, copy: 255"), "{f:?}");
+        assert_eq!(core.stats.retransmits, 1);
     }
 
     #[test]

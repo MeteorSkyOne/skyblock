@@ -13,6 +13,7 @@ mod nat;
 #[cfg(target_os = "linux")]
 mod probe;
 mod setup;
+mod shape;
 
 use std::path::PathBuf;
 

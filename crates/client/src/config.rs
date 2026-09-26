@@ -11,8 +11,10 @@ use skyblock_proto::Micros;
 use skyblock_proto::dns::normalize_domain;
 use skyblock_proto::frame::MAX_PATHS;
 use skyblock_proto::keys::{PrivateKey, Psk, PublicKey};
-use skyblock_proto::sched::{MAX_COPIES, MAX_COPY_DELAY, Policy};
+use skyblock_proto::sched::{MAX_COPIES, MAX_COPY_DELAY, MAX_PIGGYBACK, Policy};
 use skyblock_proto::timing::SECOND;
+
+use crate::games;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -78,6 +80,16 @@ pub struct TunnelConfig {
     pub bulk_exit_kbps: u32,
     /// In-channel rekey interval (SPEC §3.9); 0 turns rekeying off.
     pub rekey_interval_s: u64,
+    /// Adaptive copies (SPEC §4.5): up to this many under loss, `copies`
+    /// being the floor; unset = max(copies, 3), equal to `copies` = off.
+    pub copies_max: Option<u8>,
+    /// NACK fast retransmission, both directions.
+    pub nack: bool,
+    /// Recent game items each game packet carries along (0 = off).
+    pub piggyback: u8,
+    /// The node shapes downloads (bulk flows) to this rate; set it a bit
+    /// below the line's download speed (0 = off).
+    pub bulk_rate_mbps: f64,
 }
 
 impl Default for TunnelConfig {
@@ -91,6 +103,10 @@ impl Default for TunnelConfig {
             bulk_enter_kbps: 2000,
             bulk_exit_kbps: 1000,
             rekey_interval_s: 600,
+            copies_max: None,
+            nack: true,
+            piggyback: 0,
+            bulk_rate_mbps: 0.0,
         }
     }
 }
@@ -103,7 +119,17 @@ impl TunnelConfig {
             copy_delay: (self.copy_delay_ms * 1000.0).round() as Micros,
             bulk_enter_kbps: self.bulk_enter_kbps,
             bulk_exit_kbps: self.bulk_exit_kbps,
+            nack: self.nack,
+            piggyback: self.piggyback,
+            bulk_rate_kbps: (self.bulk_rate_mbps * 1000.0).round() as u32,
         }
+    }
+
+    /// Ceiling for adaptive copies (equal to `copies`: adaptation off).
+    pub fn copies_max(&self) -> u8 {
+        self.copies_max
+            .unwrap_or(self.copies.max(3))
+            .min(MAX_COPIES)
     }
 
     /// `None` when rekeying is off.
@@ -127,6 +153,20 @@ impl TunnelConfig {
         ensure!(
             (1..=MAX_COPIES).contains(&self.copies),
             "`tunnel.copies` must be within 1..={MAX_COPIES}"
+        );
+        if let Some(max) = self.copies_max {
+            ensure!(
+                (self.copies..=MAX_COPIES).contains(&max),
+                "`tunnel.copies_max` must be within copies..={MAX_COPIES}"
+            );
+        }
+        ensure!(
+            self.piggyback <= MAX_PIGGYBACK,
+            "`tunnel.piggyback` must be at most {MAX_PIGGYBACK}"
+        );
+        ensure!(
+            (0.0..=100_000.0).contains(&self.bulk_rate_mbps),
+            "`tunnel.bulk_rate_mbps` must be within 0..=100000"
         );
         let max_delay = MAX_COPY_DELAY as f64 / 1000.0;
         ensure!(
@@ -160,6 +200,23 @@ pub struct GameConfig {
     pub domains: Vec<String>,
 }
 
+/// Adds a template's processes and domains to a game of the same name.
+fn with_template(mut g: GameConfig) -> GameConfig {
+    if let Some(t) = games::find(&g.name) {
+        for p in t.process {
+            if !g.process.iter().any(|q| q.eq_ignore_ascii_case(p)) {
+                g.process.push((*p).to_owned());
+            }
+        }
+        for d in t.domains {
+            if !g.domains.iter().any(|e| e.eq_ignore_ascii_case(d)) {
+                g.domains.push((*d).to_owned());
+            }
+        }
+    }
+    g
+}
+
 /// Which DNS queries go through the node (SPEC §6.5).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
@@ -184,13 +241,17 @@ pub struct TunConfig {
     pub name: String,
     /// Extra routes into the tunnel, on top of the games' `ip_ranges`.
     pub routes: Vec<Ipv4Net>,
+    /// Everything into the tunnel (Wintun global mode, SPEC §6.3).
+    #[cfg_attr(not(windows), allow(dead_code))]
+    pub global: bool,
 }
 
 impl Default for TunConfig {
     fn default() -> Self {
         Self {
-            name: "sbc0".to_owned(),
+            name: if cfg!(windows) { "skyblock" } else { "sbc0" }.to_owned(),
             routes: Vec::new(),
+            global: false,
         }
     }
 }
@@ -293,17 +354,28 @@ impl Config {
     }
 
     /// The named games, or all of them when `names` is empty.
-    pub fn games(&self, names: &[String]) -> Result<Vec<&GameConfig>> {
+    /// The games to accelerate: `names`, or every configured game. A
+    /// game named like a built-in template (SPEC §6.8) gets its processes
+    /// and domains added; a name that is only a template works as is.
+    pub fn games(&self, names: &[String]) -> Result<Vec<GameConfig>> {
         if names.is_empty() {
-            return Ok(self.games.iter().collect());
+            return Ok(self.games.iter().cloned().map(with_template).collect());
         }
         names
             .iter()
             .map(|n| {
-                self.games
-                    .iter()
-                    .find(|g| &g.name == n)
-                    .with_context(|| format!("no game named {n}"))
+                if let Some(g) = self.games.iter().find(|g| &g.name == n) {
+                    Ok(with_template(g.clone()))
+                } else if let Some(t) = games::find(n) {
+                    Ok(with_template(GameConfig {
+                        name: t.name.to_owned(),
+                        process: vec![],
+                        ip_ranges: vec![],
+                        domains: vec![],
+                    }))
+                } else {
+                    bail!("no game named {n} in the config or the templates (`skyblock games`)")
+                }
             })
             .collect()
     }
@@ -346,6 +418,21 @@ mod tests {
     }
 
     #[test]
+    fn example_config_parses() {
+        let text = include_str!("../../../examples/skyblock.toml")
+            .replace("<your private key>", &PrivateKey::generate().to_base64())
+            .replace(
+                "<node public key>",
+                &PrivateKey::generate().public_key().to_string(),
+            );
+        let c = Config::parse(&text).unwrap();
+        let games = c.games(&[]).unwrap();
+        assert_eq!(games[0].process, ["cs2.exe"], "from the template");
+        assert_eq!(c.tunnel.copies_max(), 3);
+        assert!(c.tunnel.nack);
+    }
+
+    #[test]
     fn games_and_defaults() {
         let text = format!(
             "{}mode = \"tun\"\n[[game]]\nname = \"valorant\"\nprocess = [\"VALORANT-Win64-Shipping.exe\"]\n[[game]]\nname = \"cs2\"\nip_ranges = [\"198.19.0.0/24\"]\n",
@@ -354,10 +441,19 @@ mod tests {
         let c = Config::parse(&text).unwrap();
         assert_eq!(c.mode, Mode::Tun);
         assert_eq!(c.tunnel.mtu, 1400);
-        assert_eq!(c.tun.name, "sbc0");
+        assert_eq!(c.tun.name, if cfg!(windows) { "skyblock" } else { "sbc0" });
         assert_eq!(c.games(&[]).unwrap().len(), 2);
         assert_eq!(c.games(&["cs2".into()]).unwrap()[0].ip_ranges.len(), 1);
-        assert!(c.games(&["apex".into()]).is_err());
+        // cs2 is also a template: its process comes along.
+        assert_eq!(c.games(&["cs2".into()]).unwrap()[0].process, ["cs2.exe"]);
+        // A template not in the config works on its own.
+        let apex = &c.games(&["apex".into()]).unwrap()[0];
+        assert_eq!(apex.process, ["r5apex.exe", "r5apex_dx12.exe"]);
+        // Configured entries keep their own values first.
+        let v = &c.games(&["valorant".into()]).unwrap()[0];
+        assert_eq!(v.process, ["VALORANT-Win64-Shipping.exe"]);
+        assert_eq!(v.domains, ["riotgames.com", "pvp.net"]);
+        assert!(c.games(&["nope".into()]).is_err());
     }
 
     #[test]

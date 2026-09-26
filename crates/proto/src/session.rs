@@ -3,14 +3,19 @@
 //! dedup and reassembly on the way in (SPEC §3.7–3.11, §4.3).
 
 use rand::rngs::StdRng;
-use rand::{Rng, SeedableRng};
+use rand::{Rng, RngExt, SeedableRng};
 
 use crate::dedup::DedupWindow;
 use crate::frag::{self, Reassembler};
-use crate::frame::{Echo, Frame, FrameWriter, IP_FRAG_OVERHEAD, IP_OVERHEAD, Ip, IpFrag};
+use crate::frame::{
+    Echo, Frame, FrameWriter, IP_FRAG_OVERHEAD, IP_OVERHEAD, Ip, IpFrag, NackRange, PIGGY_COPY,
+    RETX_COPY,
+};
 use crate::keys::Keyset;
+use crate::nack::GapTracker;
 use crate::packet::{
-    CONTROL_PAD_MAX, MAX_BODY, PN_LEN, PacketBuf, TAG_LEN, handshake_padding, random_padding,
+    CONTROL_PAD_MAX, MAX_BODY, PN_LEN, PacketBuf, TAG_LEN, handshake_padding, padding_towards,
+    random_padding,
 };
 use crate::replay::{ReplayWindow, Seen};
 use crate::timing::KEY_RETAIN;
@@ -18,6 +23,25 @@ use crate::{Error, Micros};
 
 /// Concurrent reassemblies kept per session.
 const REASSEMBLY_SLOTS: usize = 16;
+/// Recent game packet lengths that control packets imitate (SPEC §5).
+const LEN_SAMPLES: usize = 16;
+/// Control packets land within this many bytes of the length they imitate.
+const CONTROL_LEN_JITTER: usize = 16;
+
+/// How a data packet is padded (SPEC §5).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Pad {
+    /// `[0, pad_max]`, and the length is remembered for control packets
+    /// to imitate (game items).
+    Game,
+    /// None: bulk packets are near full size, padding only costs.
+    Bulk,
+}
+
+enum Fill {
+    Data(Pad),
+    Control,
+}
 
 /// Sending half: packet numbers, data sequence numbers, padding.
 pub struct TxState {
@@ -29,6 +53,9 @@ pub struct TxState {
     pad_max: usize,
     rng: StdRng,
     buf: PacketBuf,
+    /// Body lengths of recent game packets (ring).
+    lens: [u16; LEN_SAMPLES],
+    n_lens: usize,
 }
 
 impl TxState {
@@ -41,6 +68,8 @@ impl TxState {
             pad_max,
             rng: StdRng::from_rng(&mut rand::rng()),
             buf: PacketBuf::new(),
+            lens: [0; LEN_SAMPLES],
+            n_lens: 0,
         }
     }
 
@@ -68,39 +97,75 @@ impl TxState {
         &mut self,
         f: impl FnOnce(&mut FrameWriter<'_>) -> Result<(), Error>,
     ) -> Result<&[u8], Error> {
-        self.seal(CONTROL_PAD_MAX, f)
+        self.seal(Fill::Control, f)
     }
 
-    /// Sends `ip` as a new data item: assigns sequence numbers, fragments if
-    /// needed and calls `emit` with each sealed packet. Returns the first
-    /// sequence number so that redundant copies can reuse it.
+    /// Whether `ip` fits in one data frame (otherwise it goes as IP_FRAG).
+    pub fn fits_one_frame(ip: &[u8]) -> bool {
+        ip.len() + IP_OVERHEAD <= MAX_BODY
+    }
+
+    /// Sends `ip` as a new game data item: assigns sequence numbers,
+    /// fragments if needed and calls `emit` with each sealed packet.
+    /// Returns the first sequence number so that redundant copies can
+    /// reuse it.
     pub fn send_ip(&mut self, ip: &[u8], emit: impl FnMut(&[u8])) -> Result<u32, Error> {
-        let n = if ip.len() + IP_OVERHEAD <= MAX_BODY {
-            1
-        } else {
-            ip.len().div_ceil(MAX_BODY - IP_FRAG_OVERHEAD) as u32
-        };
+        self.send_ip_with(ip, Pad::Game, &[], emit)
+    }
+
+    /// [`send_ip`](Self::send_ip) with a padding mode and, when `ip` fits
+    /// one frame, other data frames carried along in the same packet as
+    /// far as they fit (piggybacking, SPEC §4.5).
+    pub fn send_ip_with(
+        &mut self,
+        ip: &[u8],
+        pad: Pad,
+        extra: &[Frame<'_>],
+        mut emit: impl FnMut(&[u8]),
+    ) -> Result<u32, Error> {
+        if Self::fits_one_frame(ip) {
+            let seq = self.alloc_seq(1);
+            let frame = Frame::Ip(Ip {
+                seq,
+                copy: 0,
+                packet: ip,
+            });
+            emit(self.seal(Fill::Data(pad), |w| write_bundle(w, &frame, extra))?);
+            return Ok(seq);
+        }
+        let n = ip.len().div_ceil(MAX_BODY - IP_FRAG_OVERHEAD) as u32;
         let seq = self.alloc_seq(n);
-        self.send_ip_as(seq, 0, ip, emit)?;
+        self.send_frags(seq, 0, ip, pad, emit)?;
         Ok(seq)
     }
 
-    /// Sends copy `copy` of a data item whose sequence numbers start at `seq`.
+    /// Sends copy `copy` of a game data item whose sequence numbers start
+    /// at `seq`.
     pub fn send_ip_as(
         &mut self,
         seq: u32,
         copy: u8,
         ip: &[u8],
+        emit: impl FnMut(&[u8]),
+    ) -> Result<(), Error> {
+        self.send_frags(seq, copy, ip, Pad::Game, emit)
+    }
+
+    fn send_frags(
+        &mut self,
+        seq: u32,
+        copy: u8,
+        ip: &[u8],
+        pad: Pad,
         mut emit: impl FnMut(&[u8]),
     ) -> Result<(), Error> {
-        let pad_max = self.pad_max;
-        if ip.len() + IP_OVERHEAD <= MAX_BODY {
+        if Self::fits_one_frame(ip) {
             let frame = Frame::Ip(Ip {
                 seq,
                 copy,
                 packet: ip,
             });
-            emit(self.seal(pad_max, |w| w.write(&frame))?);
+            emit(self.seal(Fill::Data(pad), |w| w.write(&frame))?);
             return Ok(());
         }
         for (idx, cnt, data) in frag::split(ip, MAX_BODY - IP_FRAG_OVERHEAD)? {
@@ -111,7 +176,7 @@ impl TxState {
                 cnt,
                 data,
             });
-            emit(self.seal(pad_max, |w| w.write(&frame))?);
+            emit(self.seal(Fill::Data(pad), |w| w.write(&frame))?);
         }
         Ok(())
     }
@@ -124,16 +189,29 @@ impl TxState {
         echo: Echo<'_>,
         emit: impl FnOnce(&[u8]),
     ) -> Result<u32, Error> {
+        self.send_echo_with(request, echo, &[], emit)
+    }
+
+    /// [`send_echo`](Self::send_echo) with other data frames carried along.
+    pub fn send_echo_with(
+        &mut self,
+        request: bool,
+        echo: Echo<'_>,
+        extra: &[Frame<'_>],
+        emit: impl FnOnce(&[u8]),
+    ) -> Result<u32, Error> {
         let seq = self.alloc_seq(1);
-        self.send_echo_as(
-            request,
-            Echo {
-                seq,
-                copy: 0,
-                ..echo
-            },
-            emit,
-        )?;
+        let echo = Echo {
+            seq,
+            copy: 0,
+            ..echo
+        };
+        let frame = if request {
+            Frame::EchoReq(echo)
+        } else {
+            Frame::EchoResp(echo)
+        };
+        emit(self.seal(Fill::Data(Pad::Game), |w| write_bundle(w, &frame, extra))?);
         Ok(seq)
     }
 
@@ -149,25 +227,57 @@ impl TxState {
         } else {
             Frame::EchoResp(echo)
         };
-        let pad_max = self.pad_max;
-        emit(self.seal(pad_max, |w| w.write(&frame))?);
+        emit(self.seal(Fill::Data(Pad::Game), |w| w.write(&frame))?);
         Ok(())
     }
 
     fn seal(
         &mut self,
-        pad_max: usize,
+        fill: Fill,
         f: impl FnOnce(&mut FrameWriter<'_>) -> Result<(), Error>,
     ) -> Result<&[u8], Error> {
         let mut w = self.buf.writer();
         f(&mut w)?;
-        let pad = random_padding(&mut self.rng, w.len(), pad_max);
+        let body = w.len();
+        let pad = match fill {
+            Fill::Data(Pad::Game) => random_padding(&mut self.rng, body, self.pad_max),
+            Fill::Data(Pad::Bulk) => 0,
+            // Control packets take the length of a recent game packet, so
+            // that keepalives do not form a length cluster of their own.
+            Fill::Control if self.n_lens > 0 => {
+                let pick = self.lens[self.rng.random_range(0..self.n_lens.min(LEN_SAMPLES))];
+                let jitter = self.rng.random_range(0..=2 * CONTROL_LEN_JITTER);
+                let target = (usize::from(pick) + jitter).saturating_sub(CONTROL_LEN_JITTER);
+                padding_towards(body, target)
+            }
+            Fill::Control => random_padding(&mut self.rng, body, CONTROL_PAD_MAX),
+        };
         w.pad(pad)?;
         let len = w.len();
+        if matches!(fill, Fill::Data(Pad::Game)) {
+            self.lens[self.n_lens % LEN_SAMPLES] = len as u16;
+            self.n_lens += 1;
+        }
         let pn = self.pn;
         self.pn += 1;
         self.buf.seal(&self.keys, pn, len)
     }
+}
+
+/// `first`, then as many of `extra` as fit, in order.
+fn write_bundle(
+    w: &mut FrameWriter<'_>,
+    first: &Frame<'_>,
+    extra: &[Frame<'_>],
+) -> Result<(), Error> {
+    w.write(first)?;
+    for f in extra {
+        if f.encoded_len() > w.remaining() {
+            break;
+        }
+        w.write(f)?;
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -178,8 +288,11 @@ pub struct RxStats {
     pub unique: u64,
     /// Data frames dropped as duplicates (including too-old ones).
     pub dup: u64,
-    /// Unique data frames whose first arrival was a copy other than 0.
+    /// Unique data frames whose first arrival was a copy other than 0 ...
     pub rescued: u64,
+    /// ... of which NACK retransmissions, and piggybacked items.
+    pub retx: u64,
+    pub piggy: u64,
 }
 
 /// Payload of a data frame accepted for the first time.
@@ -240,6 +353,10 @@ pub struct RxState {
     prev: Option<(RxKeys, Micros)>,
     dedup: DedupWindow,
     reasm: Reassembler,
+    gaps: GapTracker,
+    /// How long a gap in the data sequence may stay open before it is
+    /// NACKed (`None`: no NACKs).
+    nack_wait: Option<Micros>,
     pub stats: RxStats,
 }
 
@@ -251,8 +368,29 @@ impl RxState {
             prev: None,
             dedup: DedupWindow::new(),
             reasm: Reassembler::new(REASSEMBLY_SLOTS),
+            gaps: GapTracker::new(),
+            nack_wait: None,
             stats: RxStats::default(),
         }
+    }
+
+    /// Turns NACKs on (with the wait for gaps) or off.
+    pub fn set_nack_wait(&mut self, wait: Option<Micros>) {
+        if wait.is_none() {
+            self.gaps = GapTracker::new();
+        }
+        self.nack_wait = wait;
+    }
+
+    /// Gaps due for a NACK by `now` (SPEC §4.5), into `out`.
+    pub fn nacks(&mut self, now: Micros, out: &mut Vec<NackRange>) {
+        let dedup = &self.dedup;
+        self.gaps.due(now, |s| dedup.check(s) == Seen::New, out);
+    }
+
+    /// When the next gap is due for a NACK.
+    pub fn next_nack(&self) -> Option<Micros> {
+        self.nack_wait.and(self.gaps.next_due())
     }
 
     /// Installs the keyset the peer is about to switch to, replacing any
@@ -299,9 +437,11 @@ impl RxState {
     /// incomplete fragments and control frames.
     pub fn accept<'s, 'p: 's>(&'s mut self, now: Micros, frame: &Frame<'p>) -> Option<Data<'s>> {
         match *frame {
-            Frame::Ip(f) => self.first_time(f.seq, f.copy).then_some(Data::Ip(f.packet)),
+            Frame::Ip(f) => self
+                .first_time(now, f.seq, f.copy)
+                .then_some(Data::Ip(f.packet)),
             Frame::IpFrag(f) => {
-                if !self.first_time(f.seq, f.copy) {
+                if !self.first_time(now, f.seq, f.copy) {
                     return None;
                 }
                 self.reasm
@@ -310,8 +450,12 @@ impl RxState {
                     .flatten()
                     .map(Data::Ip)
             }
-            Frame::EchoReq(e) => self.first_time(e.seq, e.copy).then_some(Data::EchoReq(e)),
-            Frame::EchoResp(e) => self.first_time(e.seq, e.copy).then_some(Data::EchoResp(e)),
+            Frame::EchoReq(e) => self
+                .first_time(now, e.seq, e.copy)
+                .then_some(Data::EchoReq(e)),
+            Frame::EchoResp(e) => self
+                .first_time(now, e.seq, e.copy)
+                .then_some(Data::EchoResp(e)),
             _ => None,
         }
     }
@@ -324,11 +468,23 @@ impl RxState {
         }
     }
 
-    fn first_time(&mut self, seq: u32, copy: u8) -> bool {
+    fn first_time(&mut self, now: Micros, seq: u32, copy: u8) -> bool {
         if self.dedup.insert(seq) == Seen::New {
             self.stats.unique += 1;
-            if copy > 0 {
-                self.stats.rescued += 1;
+            match copy {
+                0 => {}
+                RETX_COPY => {
+                    self.stats.rescued += 1;
+                    self.stats.retx += 1;
+                }
+                PIGGY_COPY => {
+                    self.stats.rescued += 1;
+                    self.stats.piggy += 1;
+                }
+                _ => self.stats.rescued += 1,
+            }
+            if let Some(wait) = self.nack_wait {
+                self.gaps.on_new(now, seq, wait);
             }
             true
         } else {
@@ -389,6 +545,78 @@ mod tests {
             }
         }
         out
+    }
+
+    #[test]
+    fn bulk_packets_are_not_padded_and_control_packets_imitate_game_ones() {
+        let (mut tx, _) = pair();
+        let bulk_len = |tx: &mut TxState| {
+            let mut n = 0;
+            tx.send_ip_with(&[0x45; 1000], Pad::Bulk, &[], |p| n = p.len())
+                .unwrap();
+            n
+        };
+        let base = 1000 + IP_OVERHEAD + crate::packet::OVERHEAD;
+        for _ in 0..20 {
+            assert_eq!(bulk_len(&mut tx), base);
+        }
+        // Before any game packet: control packets are padded [0, 96].
+        let ping = Frame::Ping(Ping {
+            path: 0,
+            id: 1,
+            ts: 2,
+        });
+        let short = ping.encoded_len() + crate::packet::OVERHEAD;
+        for _ in 0..50 {
+            let n = tx.control(|w| w.write(&ping)).unwrap().len();
+            assert!((short..=short + CONTROL_PAD_MAX).contains(&n), "{n}");
+        }
+        // After 300B game packets, they land near those lengths.
+        let mut game = vec![];
+        for _ in 0..LEN_SAMPLES {
+            tx.send_ip(&[0x45; 300], |p| game.push(p.len())).unwrap();
+        }
+        let (lo, hi) = (game.iter().min().unwrap(), game.iter().max().unwrap());
+        for _ in 0..200 {
+            let n = tx.control(|w| w.write(&ping)).unwrap().len();
+            assert!(
+                (lo - CONTROL_LEN_JITTER..=hi + CONTROL_LEN_JITTER).contains(&n),
+                "{n} outside {lo}..={hi} ± {CONTROL_LEN_JITTER}"
+            );
+        }
+    }
+
+    #[test]
+    fn gaps_are_nacked_once_they_are_due() {
+        let (mut tx, mut rx) = pair();
+        rx.set_nack_wait(Some(5_000));
+        let mut pkts = vec![];
+        for _ in 0..6 {
+            tx.send_ip(&[0x45; 40], |p| pkts.push(p.to_vec())).unwrap();
+        }
+        let accept = |rx: &mut RxState, now: Micros, pkt: &[u8]| {
+            let mut p = pkt.to_vec();
+            let (body, _) = rx.open(now, &mut p).unwrap();
+            let f = FrameReader::new(body).next().unwrap().unwrap();
+            rx.accept(now, &f).is_some()
+        };
+        for i in [0, 3, 5] {
+            assert!(accept(&mut rx, 0, &pkts[i]));
+        }
+        assert_eq!(rx.next_nack(), Some(5_000));
+        let mut out = vec![];
+        rx.nacks(4_999, &mut out);
+        assert!(out.is_empty());
+        // 4 arrives late, as a copy would.
+        assert!(accept(&mut rx, 1_000, &pkts[4]));
+        rx.nacks(5_000, &mut out);
+        let got: Vec<_> = out.iter().map(|r| (r.start, r.count)).collect();
+        assert_eq!(got, vec![(1, 2)]);
+        assert_eq!(rx.next_nack(), None);
+
+        rx.set_nack_wait(None);
+        accept(&mut rx, 6_000, &pkts[2]);
+        assert_eq!(rx.next_nack(), None, "off: no tracking");
     }
 
     #[test]

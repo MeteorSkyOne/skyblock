@@ -1,23 +1,34 @@
-//! Redundant sending (SPEC §4.2). Copy 0 of a data item goes out at once on
-//! the best path; copy `c` follows `c × copy_delay` later on the `c`-th
-//! path of the ranking. Every copy is a separate packet with its own PN
-//! and padding, sealed when it is sent.
+//! Redundant sending (SPEC §4.2, §4.5). Copy 0 of a data item goes out at
+//! once on the best path; copy `c` follows `c × copy_delay` later on the
+//! `c`-th path of the ranking. Every copy is a separate packet with its own
+//! PN and padding, sealed when it is sent. Recent game items are kept for
+//! NACK retransmission and for piggybacking on later game packets.
 
 use std::collections::VecDeque;
 
 use crate::flow::{Class, Flow};
-use crate::frame::{Echo, Tune};
+use crate::frame::{Echo, Frame, Ip, NackRange, PIGGY_COPY, RETX_COPY, TUNE_NACK, Tune};
 use crate::path::Ranking;
-use crate::session::TxState;
+use crate::session::{Pad, TxState};
 use crate::timing::MS;
 use crate::{Error, Micros};
 
 pub const MAX_COPIES: u8 = 4;
 pub const MAX_COPY_DELAY: Micros = 50 * MS;
+/// Most recent items a game packet carries along.
+pub const MAX_PIGGYBACK: u8 = 8;
 /// Largest data item kept for delayed copies; bigger ones get copy 0 only.
 const MAX_DELAYED_LEN: usize = 1500;
 /// Bound on each per-copy queue; copies beyond it are dropped.
 const QUEUE_CAP: usize = 1024;
+/// Game items are kept this long for NACK retransmission ...
+pub const RETX_HORIZON: Micros = 500 * MS;
+/// ... and piggybacked only while this young.
+pub const PIGGY_HORIZON: Micros = 50 * MS;
+/// Recent game items kept, at most.
+const RECENT_CAP: usize = 256;
+/// Retransmissions per NACK, at most.
+const MAX_RETX_PER_NACK: usize = 64;
 
 /// Redundancy settings for one direction of a session.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -28,6 +39,12 @@ pub struct Policy {
     pub copy_delay: Micros,
     pub bulk_enter_kbps: u32,
     pub bulk_exit_kbps: u32,
+    /// NACK fast retransmission (both directions; the receiver asks).
+    pub nack: bool,
+    /// Recent game items each game packet carries along (0 = off).
+    pub piggyback: u8,
+    /// Towards the client: shape bulk flows to this rate (0 = off).
+    pub bulk_rate_kbps: u32,
 }
 
 impl Policy {
@@ -38,6 +55,9 @@ impl Policy {
         copy_delay: 0,
         bulk_enter_kbps: 2000,
         bulk_exit_kbps: 1000,
+        nack: false,
+        piggyback: 0,
+        bulk_rate_kbps: 0,
     };
 
     /// Clamps values from the wire to sane ranges.
@@ -49,6 +69,9 @@ impl Policy {
             copy_delay: Micros::from(t.copy_delay_us).min(MAX_COPY_DELAY),
             bulk_enter_kbps: enter,
             bulk_exit_kbps: t.bulk_exit_kbps.min(enter),
+            nack: t.flags & TUNE_NACK != 0,
+            piggyback: t.piggyback.min(MAX_PIGGYBACK),
+            bulk_rate_kbps: t.bulk_rate_kbps,
         }
     }
 
@@ -59,7 +82,15 @@ impl Policy {
             copy_delay_us: self.copy_delay as u32,
             bulk_enter_kbps: self.bulk_enter_kbps,
             bulk_exit_kbps: self.bulk_exit_kbps,
+            flags: if self.nack { TUNE_NACK } else { 0 },
+            piggyback: self.piggyback,
+            bulk_rate_kbps: self.bulk_rate_kbps,
         }
+    }
+
+    /// Whether game items must be kept after sending.
+    fn keeps_recent(&self) -> bool {
+        self.nack || self.piggyback > 0
     }
 }
 
@@ -69,8 +100,12 @@ pub struct Plan {
     copies: u8,
     delay: Micros,
     max_paths: u8,
-    /// Single copy on the path this flow hash maps to (bulk flows).
+    /// Single copy on the path this flow hash maps to, unpadded (bulk
+    /// flows).
     pinned: Option<u64>,
+    /// Keep the item for NACKs and piggybacking.
+    keep: bool,
+    piggyback: u8,
 }
 
 impl Plan {
@@ -80,6 +115,8 @@ impl Plan {
             delay: p.copy_delay,
             max_paths: p.paths,
             pinned: None,
+            keep: p.keeps_recent(),
+            piggyback: p.piggyback.min(MAX_PIGGYBACK),
         }
     }
 
@@ -91,6 +128,8 @@ impl Plan {
                 delay: 0,
                 max_paths: 0,
                 pinned: Some(flow.hash),
+                keep: false,
+                piggyback: 0,
             },
         }
     }
@@ -122,12 +161,55 @@ pub struct SchedStats {
     pub copies_sent: u64,
     /// Copies not sent: queue full or item too large to keep.
     pub copies_dropped: u64,
+    /// Items resent for a NACK.
+    pub retransmits: u64,
+    /// Items carried along in later packets.
+    pub piggybacked: u64,
+}
+
+/// A game item sent lately.
+struct Recent {
+    at: Micros,
+    seq: u32,
+    kind: Kind,
+    resent: bool,
+    len: u16,
+    data: [u8; MAX_DELAYED_LEN],
+}
+
+impl Recent {
+    fn frame(&self) -> Frame<'_> {
+        let data = &self.data[..usize::from(self.len)];
+        match self.kind {
+            Kind::Ip => Frame::Ip(Ip {
+                seq: self.seq,
+                copy: PIGGY_COPY,
+                packet: data,
+            }),
+            Kind::Echo { request, id, ts } => {
+                let e = Echo {
+                    seq: self.seq,
+                    copy: PIGGY_COPY,
+                    id,
+                    ts,
+                    payload: data,
+                };
+                if request {
+                    Frame::EchoReq(e)
+                } else {
+                    Frame::EchoResp(e)
+                }
+            }
+        }
+    }
 }
 
 /// Sends data items with their redundant copies, holding delayed copies
 /// until they are due.
 pub struct Scheduler {
     queues: [VecDeque<Pending>; MAX_COPIES as usize - 1],
+    /// Game items of the last `RETX_HORIZON`, oldest first.
+    recent: VecDeque<Recent>,
     pub stats: SchedStats,
 }
 
@@ -141,6 +223,7 @@ impl Scheduler {
     pub fn new() -> Self {
         Self {
             queues: Default::default(),
+            recent: VecDeque::new(),
             stats: SchedStats::default(),
         }
     }
@@ -162,7 +245,18 @@ impl Scheduler {
             None => ranking.pick(0, plan.max_paths),
         };
         let Some(path) = first else { return Ok(()) };
-        let seq = tx.send_ip(ip, |pkt| emit(path, pkt))?;
+        let pad = if plan.pinned.is_some() {
+            Pad::Bulk
+        } else {
+            Pad::Game
+        };
+        let mut extra = [Frame::Close(0); MAX_PIGGYBACK as usize];
+        let n = self.piggyback(now, plan, &mut extra);
+        let seq = tx.send_ip_with(ip, pad, &extra[..n], |pkt| emit(path, pkt))?;
+        self.stats.piggybacked += n as u64;
+        if plan.keep && TxState::fits_one_frame(ip) {
+            self.remember(now, seq, Kind::Ip, ip);
+        }
         self.follow_up(tx, now, seq, Kind::Ip, ip, plan, ranking, emit)
     }
 
@@ -190,9 +284,91 @@ impl Scheduler {
             ts,
             payload,
         };
-        let seq = tx.send_echo(request, echo, |pkt| emit(path, pkt))?;
+        let mut extra = [Frame::Close(0); MAX_PIGGYBACK as usize];
+        let n = self.piggyback(now, plan, &mut extra);
+        let seq = tx.send_echo_with(request, echo, &extra[..n], |pkt| emit(path, pkt))?;
+        self.stats.piggybacked += n as u64;
         let kind = Kind::Echo { request, id, ts };
+        if plan.keep && payload.len() <= MAX_DELAYED_LEN {
+            self.remember(now, seq, kind, payload);
+        }
         self.follow_up(tx, now, seq, kind, payload, plan, ranking, emit)
+    }
+
+    /// Resends the kept items a NACK asks for, once each, on the best
+    /// path. Items not kept (bulk, too old, already resent) are skipped.
+    /// Returns how many went out.
+    pub fn on_nack(
+        &mut self,
+        tx: &mut TxState,
+        now: Micros,
+        ranges: impl Iterator<Item = NackRange>,
+        ranking: &Ranking,
+        mut emit: impl FnMut(usize, &[u8]),
+    ) -> usize {
+        let Some(path) = ranking.pick(0, 0) else {
+            return 0;
+        };
+        let mut sent = 0;
+        'ranges: for r in ranges {
+            for i in 0..u32::from(r.count) {
+                if sent == MAX_RETX_PER_NACK {
+                    break 'ranges;
+                }
+                let seq = r.start.wrapping_add(i);
+                let Some(item) = self.recent.iter_mut().find(|x| x.seq == seq) else {
+                    continue;
+                };
+                if item.resent || now.saturating_sub(item.at) > RETX_HORIZON {
+                    continue;
+                }
+                item.resent = true;
+                let data = &item.data[..usize::from(item.len)];
+                if send_copy(tx, seq, RETX_COPY, item.kind, data, |pkt| emit(path, pkt)).is_ok() {
+                    sent += 1;
+                }
+            }
+        }
+        self.stats.retransmits += sent as u64;
+        sent
+    }
+
+    /// Fills `out` with the newest kept items young enough to piggyback,
+    /// newest first; returns how many.
+    fn piggyback<'s>(&'s self, now: Micros, plan: Plan, out: &mut [Frame<'s>]) -> usize {
+        let mut n = 0;
+        for r in self.recent.iter().rev() {
+            if n == usize::from(plan.piggyback)
+                || n == out.len()
+                || now.saturating_sub(r.at) > PIGGY_HORIZON
+            {
+                break;
+            }
+            out[n] = r.frame();
+            n += 1;
+        }
+        n
+    }
+
+    fn remember(&mut self, now: Micros, seq: u32, kind: Kind, data: &[u8]) {
+        while self.recent.len() >= RECENT_CAP
+            || self
+                .recent
+                .front()
+                .is_some_and(|r| now.saturating_sub(r.at) > RETX_HORIZON)
+        {
+            self.recent.pop_front();
+        }
+        let mut r = Recent {
+            at: now,
+            seq,
+            kind,
+            resent: false,
+            len: data.len() as u16,
+            data: [0; MAX_DELAYED_LEN],
+        };
+        r.data[..data.len()].copy_from_slice(data);
+        self.recent.push_back(r);
     }
 
     /// Sends the delayed copies that are due, each on the path its copy
@@ -469,6 +645,142 @@ mod tests {
         assert_eq!((e.id, e.ts, e.copy, e.payload), (42, 777, 1, &b"hello"[..]));
     }
 
+    /// All data frames of a packet as (seq, copy), accepting them.
+    fn frames(rx: &mut RxState, now: Micros, pkt: &[u8]) -> Vec<(u32, u8, bool)> {
+        let mut p = pkt.to_vec();
+        let (body, _) = rx.open(now, &mut p).unwrap();
+        let fs: Vec<Frame<'_>> = FrameReader::new(body).map(|f| f.unwrap()).collect();
+        fs.iter()
+            .map(|f| {
+                let (seq, copy) = match f {
+                    Frame::Ip(i) => (i.seq, i.copy),
+                    Frame::EchoReq(e) | Frame::EchoResp(e) => (e.seq, e.copy),
+                    other => panic!("unexpected {other:?}"),
+                };
+                (seq, copy, rx.accept(now, f).is_some())
+            })
+            .collect()
+    }
+
+    #[test]
+    fn nacked_game_items_are_resent_once() {
+        let (mut tx, mut rx, r) = setup(2);
+        let mut s = Scheduler::new();
+        let p = Policy {
+            nack: true,
+            ..policy(1, 0)
+        };
+        let mut out = vec![];
+        for i in 0..5 {
+            s.send_ip(
+                &mut tx,
+                i * MS,
+                &[0x45; 40],
+                Plan::redundant(&p),
+                &r,
+                |_, pkt| out.push(pkt.to_vec()),
+            )
+            .unwrap();
+        }
+        let ranges = [
+            NackRange { start: 1, count: 2 },
+            NackRange { start: 9, count: 1 },
+        ];
+        let mut resent = vec![];
+        let n = s.on_nack(&mut tx, 10 * MS, ranges.into_iter(), &r, |path, pkt| {
+            resent.push((path, pkt.to_vec()))
+        });
+        assert_eq!(n, 2, "9 was never sent");
+        assert!(resent.iter().all(|(path, _)| *path == 0), "best path");
+        let seen: Vec<_> = resent
+            .iter()
+            .flat_map(|(_, p)| frames(&mut rx, 0, p))
+            .collect();
+        assert_eq!(seen, vec![(1, RETX_COPY, true), (2, RETX_COPY, true)]);
+        assert_eq!(rx.stats.retx, 2);
+        // Once only, and not after the horizon.
+        assert_eq!(
+            s.on_nack(&mut tx, 10 * MS, ranges.into_iter(), &r, |_, _| {}),
+            0
+        );
+        let late = [NackRange { start: 3, count: 1 }];
+        assert_eq!(
+            s.on_nack(
+                &mut tx,
+                3 * MS + RETX_HORIZON + 1,
+                late.into_iter(),
+                &r,
+                |_, _| {}
+            ),
+            0
+        );
+        assert_eq!(s.stats.retransmits, 2);
+    }
+
+    #[test]
+    fn bulk_items_are_not_kept() {
+        let (mut tx, _rx, r) = setup(2);
+        let mut s = Scheduler::new();
+        let p = Policy {
+            nack: true,
+            ..policy(1, 0)
+        };
+        let bulk = Flow {
+            class: Class::Bulk,
+            hash: 1,
+        };
+        s.send_ip(
+            &mut tx,
+            0,
+            &[0x45; 1000],
+            Plan::for_flow(&p, bulk),
+            &r,
+            |_, _| {},
+        )
+        .unwrap();
+        let ranges = [NackRange { start: 0, count: 1 }];
+        assert_eq!(s.on_nack(&mut tx, MS, ranges.into_iter(), &r, |_, _| {}), 0);
+    }
+
+    #[test]
+    fn game_packets_carry_recent_items_along() {
+        let (mut tx, mut rx, r) = setup(1);
+        let mut s = Scheduler::new();
+        let p = Policy {
+            piggyback: 2,
+            ..policy(1, 0)
+        };
+        let mut out = vec![];
+        for t in [0, 10 * MS, 20 * MS, 30 * MS, 200 * MS] {
+            s.send_ip(
+                &mut tx,
+                t,
+                &[0x45; 40],
+                Plan::redundant(&p),
+                &r,
+                |_, pkt| out.push(pkt.to_vec()),
+            )
+            .unwrap();
+        }
+        // Packet 1 (seq 1) is lost; the next ones carry it along.
+        let got: Vec<_> = [0, 2, 3, 4]
+            .iter()
+            .map(|&i| frames(&mut rx, 0, &out[i]))
+            .collect();
+        assert_eq!(got[0], vec![(0, 0, true)]);
+        assert_eq!(
+            got[1],
+            vec![(2, 0, true), (1, PIGGY_COPY, true), (0, PIGGY_COPY, false)]
+        );
+        assert_eq!(
+            got[2],
+            vec![(3, 0, true), (2, PIGGY_COPY, false), (1, PIGGY_COPY, false)]
+        );
+        assert_eq!(got[3], vec![(4, 0, true)], "older than the horizon");
+        assert_eq!(rx.stats.piggy, 1);
+        assert_eq!(s.stats.piggybacked, 5, "0 + 1 + 2 + 2 + 0");
+    }
+
     #[test]
     fn policy_from_wire_is_clamped() {
         let p = Policy::from_tune(&Tune {
@@ -477,10 +789,16 @@ mod tests {
             copy_delay_us: u32::MAX,
             bulk_enter_kbps: 100,
             bulk_exit_kbps: 500,
+            flags: 0xFF,
+            piggyback: 200,
+            bulk_rate_kbps: 50_000,
         });
         assert_eq!(p.copies, MAX_COPIES);
         assert_eq!(p.copy_delay, MAX_COPY_DELAY);
         assert_eq!(p.bulk_exit_kbps, 100);
+        assert!(p.nack);
+        assert_eq!(p.piggyback, MAX_PIGGYBACK);
+        assert_eq!(p.bulk_rate_kbps, 50_000);
         assert_eq!(Policy::from_tune(&p.to_tune()), p);
     }
 }

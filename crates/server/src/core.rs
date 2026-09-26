@@ -10,11 +10,14 @@ use std::net::{Ipv4Addr, SocketAddr};
 use rand::SeedableRng;
 use rand::rngs::StdRng;
 use skyblock_proto::Micros;
-use skyblock_proto::flow::{Class, FlowClassifier, FlowKey};
-use skyblock_proto::frame::{Frame, FrameReader, PathStats, Pong, ProbeReq, ProbeResp, Stats};
+use skyblock_proto::flow::{Class, Flow, FlowClassifier, FlowKey};
+use skyblock_proto::frame::{
+    Frame, FrameReader, NackRange, PathStats, Pong, ProbeReq, ProbeResp, Stats,
+};
 use skyblock_proto::handshake::{MAX_MSG_LEN, PendingResponse, ServerHello};
 use skyblock_proto::ip::Ipv4Packet;
 use skyblock_proto::keys::{Keyset, PrivateKey, Psk, PublicKey, SessionKeys};
+use skyblock_proto::nack;
 use skyblock_proto::packet::{MIN_LEN, PacketBuf};
 use skyblock_proto::path::{PathMetrics, Ranking, down_after};
 use skyblock_proto::sched::{Plan, Policy, SchedStats, Scheduler};
@@ -26,6 +29,7 @@ use tracing::{debug, info};
 
 use crate::filter::InnerFilter;
 use crate::limit::RateLimiter;
+use crate::shape::Shaper;
 
 /// A session whose client never proved key possession is dropped sooner.
 const UNCONFIRMED_EXPIRE: Micros = 30 * SECOND;
@@ -115,6 +119,10 @@ struct Session {
     /// sends under its new keys.
     next_tx: Option<Keyset>,
     rekeys: u64,
+    /// Bulk shaping towards the client (`TUNE` `bulk_rate_kbps`).
+    shaper: Option<Shaper>,
+    /// NACK frames sent to the client.
+    nacks_sent: u64,
 }
 
 impl Session {
@@ -127,6 +135,14 @@ impl Session {
             self.next_stats = self.next_stats.min(now + STATS_ACTIVE);
         }
         self.last_active = now;
+    }
+
+    /// The best path's smoothed RTT as the client reports it (0: none yet).
+    fn best_srtt(&self) -> Micros {
+        self.ranking
+            .best()
+            .and_then(|i| self.paths.get(i))
+            .map_or(0, |p| p.m.rtt.srtt)
     }
 
     fn rerank(&mut self, now: Micros) {
@@ -151,6 +167,8 @@ pub struct Core {
     trial_limit: RateLimiter,
     rng: StdRng,
     hs_buf: PacketBuf,
+    /// Scratch space for NACK ranges.
+    nack_buf: Vec<NackRange>,
     pub stats: CoreStats,
 }
 
@@ -179,6 +197,7 @@ impl Core {
             trial_limit: RateLimiter::per_ip(20.0, 20.0),
             rng: StdRng::from_rng(&mut rand::rng()),
             hs_buf: PacketBuf::new(),
+            nack_buf: Vec::new(),
             stats: CoreStats::default(),
         }
     }
@@ -264,6 +283,13 @@ impl Core {
         };
         s.touch(now);
         let flow = s.flows.classify(now, FlowKey::of(&p), ip.len());
+        if flow.class == Class::Bulk
+            && let Some(sh) = &mut s.shaper
+            && !sh.offer(now, flow.hash, ip)
+        {
+            // Queued behind the bucket (or dropped: queue full).
+            return true;
+        }
         let plan = Plan::for_flow(&s.policy, flow);
         let Session {
             tx,
@@ -289,25 +315,55 @@ impl Core {
         ok
     }
 
-    /// Sends delayed copies that are due.
+    /// Sends delayed copies and shaped bulk packets that are due, and
+    /// NACKs for gaps that stayed open.
     pub fn poll(&mut self, now: Micros, io: &mut impl ServerIo) {
+        let nacks = &mut self.nack_buf;
         for s in self.sessions.iter_mut().flatten() {
-            if s.sched.next_due().is_none_or(|d| d > now) {
-                continue;
-            }
             let Session {
                 tx,
+                rx,
                 sched,
                 paths,
                 ranking,
+                policy,
+                shaper,
+                nacks_sent,
                 ..
             } = s;
-            sched.poll(tx, now, ranking, |i, pkt| {
+            let mut send = |i: usize, pkt: &[u8]| {
                 if let Some(p) = paths.get_mut(i) {
                     p.m.tx_pkts += 1;
                     io.send(p.sock, p.addr, pkt);
                 }
-            });
+            };
+            if sched.next_due().is_some_and(|d| d <= now) {
+                sched.poll(tx, now, ranking, &mut send);
+            }
+            if let Some(sh) = shaper
+                && sh.next_due().is_some_and(|d| d <= now)
+            {
+                sh.poll(now, |hash, pkt| {
+                    let plan = Plan::for_flow(
+                        policy,
+                        Flow {
+                            class: Class::Bulk,
+                            hash,
+                        },
+                    );
+                    let _ = sched.send_ip(tx, now, pkt, plan, ranking, &mut send);
+                });
+            }
+            if rx.next_nack().is_some_and(|d| d <= now) {
+                rx.nacks(now, nacks);
+                if !nacks.is_empty()
+                    && let Some(best) = ranking.best()
+                    && let Ok(out) = tx.control(|w| w.nack(nacks))
+                {
+                    send(best, out);
+                    *nacks_sent += 1;
+                }
+            }
         }
     }
 
@@ -329,12 +385,19 @@ impl Core {
         true
     }
 
-    /// When the earliest delayed copy is due.
+    /// When the earliest delayed copy, shaped packet or NACK is due.
     pub fn next_due(&self) -> Option<Micros> {
         self.sessions
             .iter()
             .flatten()
-            .filter_map(|s| s.sched.next_due())
+            .flat_map(|s| {
+                [
+                    s.sched.next_due(),
+                    s.shaper.as_ref().and_then(Shaper::next_due),
+                    s.rx.next_nack(),
+                ]
+            })
+            .flatten()
             .min()
     }
 
@@ -444,6 +507,32 @@ impl Core {
                 s.tx.items_sent(),
                 s.sched.stats.copies_sent,
             );
+            if s.policy.nack || s.policy.piggyback > 0 {
+                let _ = writeln!(
+                    out,
+                    "  recovery: nack {}, piggyback {}; received {} retransmitted, {} piggybacked; sent {} NACKs, {} retransmits, {} piggybacked",
+                    if s.policy.nack { "on" } else { "off" },
+                    s.policy.piggyback,
+                    r.retx,
+                    r.piggy,
+                    s.nacks_sent,
+                    s.sched.stats.retransmits,
+                    s.sched.stats.piggybacked,
+                );
+            }
+            if let Some(sh) = &s.shaper {
+                let st = sh.stats;
+                let _ = writeln!(
+                    out,
+                    "  shaping {}kbps: passed {}, queued {}, dropped {}, backlog {}/{} bytes",
+                    sh.rate_kbps(),
+                    st.passed,
+                    st.queued,
+                    st.dropped,
+                    sh.queued_bytes(),
+                    sh.limit_bytes(),
+                );
+            }
         }
     }
 
@@ -522,6 +611,8 @@ impl Core {
             established: now,
             next_tx: None,
             rekeys: 0,
+            shaper: None,
+            nacks_sent: 0,
         };
         s.rerank(now);
         self.sessions[u] = Some(s);
@@ -623,8 +714,36 @@ impl Core {
                         debug!(user = %users[u].name, ?policy, "redundancy policy");
                         s.flows
                             .set_thresholds(policy.bulk_enter_kbps, policy.bulk_exit_kbps);
+                        s.rx.set_nack_wait(policy.nack.then(|| nack::wait_for(policy.copy_delay)));
+                        let rate = policy.bulk_rate_kbps;
+                        let same = s
+                            .shaper
+                            .as_ref()
+                            .is_some_and(|sh| sh.rate_kbps() == u64::from(rate));
+                        if rate == 0 {
+                            s.shaper = None;
+                        } else if !same {
+                            let mut sh = Shaper::new(now, rate);
+                            sh.set_rtt(s.best_srtt());
+                            s.shaper = Some(sh);
+                        }
                         s.policy = policy;
                     }
+                }
+                Frame::Nack(n) => {
+                    let Session {
+                        tx,
+                        sched,
+                        paths,
+                        ranking,
+                        ..
+                    } = &mut *s;
+                    sched.on_nack(tx, now, n.ranges(), ranking, |i, pkt| {
+                        if let Some(p) = paths.get_mut(i) {
+                            p.m.tx_pkts += 1;
+                            io.send(p.sock, p.addr, pkt);
+                        }
+                    });
                 }
                 Frame::Stats(st) => {
                     for ps in st.paths() {
@@ -637,6 +756,10 @@ impl Core {
                         }
                     }
                     s.rerank(now);
+                    let rtt = s.best_srtt();
+                    if let Some(sh) = &mut s.shaper {
+                        sh.set_rtt(rtt);
+                    }
                 }
                 Frame::RekeyInit(msg) => {
                     if !hs_limit.allow(now, from.ip()) {
@@ -867,7 +990,7 @@ fn send_stats(s: &mut Session, now: Micros, io: &mut impl ServerIo) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use skyblock_proto::frame::{Echo, Ping, Tune};
+    use skyblock_proto::frame::{Echo, Ping, TUNE_NACK, Tune};
     use skyblock_proto::handshake::{ClientHello, Initiator, next_timestamp};
     use skyblock_proto::ip::build_udp;
     use skyblock_proto::timing::MS;
@@ -1012,14 +1135,25 @@ mod tests {
 
         /// Registers `n` paths from ports 1000, 1001, ... with copies/delay.
         fn connect(&mut self, n: u8, copies: u8, delay_us: u32) {
+            self.connect_with(
+                n,
+                Tune {
+                    copies,
+                    paths: 0,
+                    copy_delay_us: delay_us,
+                    bulk_enter_kbps: 2000,
+                    bulk_exit_kbps: 1000,
+                    flags: 0,
+                    piggyback: 0,
+                    bulk_rate_kbps: 0,
+                },
+            );
+        }
+
+        /// [`connect`](Self::connect) with a full `TUNE`.
+        fn connect_with(&mut self, n: u8, tune: Tune) {
             self.handshake(addr(1000));
-            let tune = Frame::Tune(Tune {
-                copies,
-                paths: 0,
-                copy_delay_us: delay_us,
-                bulk_enter_kbps: 2000,
-                bulk_exit_kbps: 1000,
-            });
+            let tune = Frame::Tune(tune);
             for i in 0..n {
                 let pkt = self.client_control(&[
                     Frame::Ping(Ping {
@@ -1266,6 +1400,93 @@ mod tests {
         assert!(h.core.stats.sent_bulk > 0);
         h.core.send_ip(t, 0, &udp(GAME, VIP), &mut h.io);
         assert_eq!(h.io.sent.len(), 3, "game flow still doubled");
+    }
+
+    fn tune(copies: u8, flags: u8, bulk_rate_kbps: u32) -> Tune {
+        Tune {
+            copies,
+            paths: 0,
+            copy_delay_us: 0,
+            bulk_enter_kbps: 2000,
+            bulk_exit_kbps: 1000,
+            flags,
+            piggyback: 0,
+            bulk_rate_kbps,
+        }
+    }
+
+    #[test]
+    fn nack_both_ways() {
+        let mut h = Harness::new();
+        h.connect_with(1, tune(1, TUNE_NACK, 0));
+        // Down: game items are kept and resent once for a NACK.
+        for t in 0..3 {
+            assert!(h.core.send_ip(10 + t, 0, &udp(GAME, VIP), &mut h.io));
+        }
+        h.io.sent.clear();
+        let nack = [NackRange { start: 1, count: 1 }];
+        let pkt = h
+            .client
+            .tx
+            .as_mut()
+            .unwrap()
+            .control(|w| w.nack(&nack))
+            .unwrap()
+            .to_vec();
+        h.feed(20, addr(1000), &pkt);
+        let (_, _, resent) = h.io.sent.pop().expect("retransmission");
+        let f = h.client_open(&resent);
+        assert!(f[0].starts_with("Ip(Ip { seq: 1, copy: 255"), "{f:?}");
+
+        // Up: a gap in the client's items gets a NACK once it is due.
+        let a = h.client_ip(&udp(VIP, GAME));
+        let _lost = h.client_ip(&udp(VIP, GAME));
+        let c = h.client_ip(&udp(VIP, GAME));
+        h.feed(100, addr(1000), &a);
+        h.feed(101, addr(1000), &c);
+        assert_eq!(h.core.next_due(), Some(101 + 5 * MS));
+        h.io.sent.clear();
+        h.core.poll(101 + 5 * MS - 1, &mut h.io);
+        assert!(h.io.sent.is_empty());
+        h.core.poll(101 + 5 * MS, &mut h.io);
+        let (_, _, pkt) = h.io.sent.pop().expect("NACK");
+        assert!(h.client_open(&pkt)[0].starts_with("Nack"));
+        assert_eq!(h.core.next_due(), None);
+    }
+
+    #[test]
+    fn bulk_is_shaped_while_game_packets_pass() {
+        let mut h = Harness::new();
+        // 8000 kbps = 1 MB/s; the download below offers 2.4 MB/s.
+        h.connect_with(1, tune(2, 0, 8000));
+        let big = udp_sized(GAME, 443, VIP, 1200);
+        let mut t = 10;
+        let mut sent_late = 0;
+        for i in 0..3000 {
+            if i == 2000 {
+                h.io.sent.clear();
+            }
+            h.core.send_ip(t, 0, &big, &mut h.io);
+            h.core.poll(t, &mut h.io);
+            t += 500;
+            if i >= 2000 {
+                sent_late = h.io.sent.len();
+            }
+        }
+        // The last 0.5s (well after classification): 1 MB/s of 1256B packets.
+        assert!((380..=420).contains(&sent_late), "{sent_late}");
+        h.io.sent.clear();
+        assert!(h.core.send_ip(t, 0, &udp(GAME, VIP), &mut h.io));
+        assert_eq!(h.io.sent.len(), 2, "game packets skip the bulk queue");
+        let mut out = String::new();
+        h.core.report(t, &[40001], |_| String::new(), &mut out);
+        assert!(out.contains("  shaping 8000kbps: passed"), "{out}");
+        // Rate 0 turns shaping off.
+        let off = h.client_control(&[Frame::Tune(tune(2, 0, 0))]);
+        h.feed(t, addr(1000), &off);
+        let mut out = String::new();
+        h.core.report(t, &[40001], |_| String::new(), &mut out);
+        assert!(!out.contains("shaping"));
     }
 
     #[test]

@@ -8,6 +8,7 @@ mod core;
 mod dns;
 #[cfg_attr(not(windows), allow(dead_code))]
 mod flows;
+mod games;
 mod ping;
 #[cfg(windows)]
 mod procmap;
@@ -15,13 +16,15 @@ mod report;
 mod tunnel;
 #[cfg(windows)]
 mod windivert;
+#[cfg(windows)]
+mod wintun;
 
 use std::net::Ipv4Addr;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
 use skyblock_proto::frame::ProbeKind;
 use skyblock_proto::keys::PrivateKey;
@@ -114,6 +117,20 @@ enum Command {
         /// Copy delays to try, in ms (default: from the config).
         #[arg(long = "delay-ms", value_delimiter = ',')]
         delays_ms: Vec<f64>,
+        /// Also retransmit on NACK (off by default: settings compare
+        /// redundancy alone).
+        #[arg(long)]
+        nack: bool,
+        /// Recent items each packet carries along (0-8).
+        #[arg(long, default_value_t = 0)]
+        piggyback: u8,
+    },
+    /// List the built-in game templates, or print a game's server address
+    /// ranges (from its ASNs, via RIPEstat) as a config line.
+    Games {
+        /// Print `ip_ranges = [...]` for this template.
+        #[arg(long)]
+        ranges: Option<String>,
     },
 }
 
@@ -208,6 +225,7 @@ fn main() -> Result<()> {
             };
             ping::run(&cfg, &args)
         }
+        Command::Games { ranges } => games_cmd(ranges.as_deref()),
         Command::Bench {
             config,
             node,
@@ -218,6 +236,8 @@ fn main() -> Result<()> {
             copies,
             paths,
             delays_ms,
+            nack,
+            piggyback,
         } => {
             let cfg = Config::load(&config)?;
             let node = cfg.node(node.as_deref())?.clone();
@@ -232,6 +252,9 @@ fn main() -> Result<()> {
             } else {
                 delays_ms
             };
+            if piggyback > skyblock_proto::sched::MAX_PIGGYBACK {
+                bail!("--piggyback must be at most 8");
+            }
             let args = BenchArgs {
                 duration,
                 warmup,
@@ -240,10 +263,39 @@ fn main() -> Result<()> {
                 copies,
                 paths,
                 delays_ms,
+                nack,
+                piggyback,
             };
             bench::run(&cfg, &node, &args)
         }
     }
+}
+
+fn games_cmd(ranges: Option<&str>) -> Result<()> {
+    let Some(name) = ranges else {
+        print!("{}", games::list());
+        println!(
+            "\nUse a name as `--game NAME` or `[[game]] name = \"NAME\"` (processes and domains come along)."
+        );
+        return Ok(());
+    };
+    let t = games::find(name).with_context(|| format!("no template named {name}"))?;
+    if t.asns.is_empty() {
+        bail!(
+            "{} runs on public clouds; no address ranges to list (use WinDivert mode or [tun] global = true)",
+            t.title
+        );
+    }
+    let nets = games::announced(t.asns)?;
+    let asns: Vec<String> = t.asns.iter().map(|a| format!("AS{a}")).collect();
+    println!(
+        "# {}: {} prefixes announced by {}",
+        t.title,
+        nets.len(),
+        asns.join(", ")
+    );
+    println!("{}", games::ranges_toml(&nets));
+    Ok(())
 }
 
 fn up(
@@ -265,14 +317,19 @@ fn up(
         cfg.tunnel.paths,
         cfg.tunnel.policy(),
     )
-    .with_rekey_interval(cfg.tunnel.rekey_interval());
+    .with_rekey_interval(cfg.tunnel.rekey_interval())
+    .with_adaptive_copies(cfg.tunnel.copies_max());
     info!(
         node = %node.name,
         addr = %node.addr,
         ports = ?node.ports,
         paths = cfg.tunnel.paths,
         copies = cfg.tunnel.copies,
+        copies_max = cfg.tunnel.copies_max(),
         copy_delay_ms = cfg.tunnel.copy_delay_ms,
+        nack = cfg.tunnel.nack,
+        piggyback = cfg.tunnel.piggyback,
+        bulk_rate_mbps = cfg.tunnel.bulk_rate_mbps,
         "connecting"
     );
     let tunnel = Tunnel::start(core, &node, cfg.tunnel.paths)?;
@@ -283,11 +340,13 @@ fn up(
     let capture = open_capture(mode, &cfg, &games, &nodes, &hello, mtu)?;
     tunnel.set_capture(Arc::clone(&capture));
     let t = Arc::clone(&tunnel);
-    capture.start(Arc::new(move |pkt: &mut [u8]| t.send_ip(pkt)))?;
+    Arc::clone(&capture).start(Arc::new(move |pkt: &mut [u8]| t.send_ip(pkt)))?;
 
     let t = Arc::clone(&tunnel);
+    let c = Arc::clone(&capture);
     ctrlc::set_handler(move || {
         t.close();
+        c.stop();
         std::process::exit(0);
     })?;
     status_loop(&tunnel, &node.name)
@@ -297,7 +356,7 @@ fn up(
 fn open_capture(
     mode: Mode,
     cfg: &Config,
-    games: &[&GameConfig],
+    games: &[GameConfig],
     nodes: &[Ipv4Addr],
     hello: &skyblock_proto::handshake::ServerHello,
     mtu: u16,
@@ -314,6 +373,36 @@ fn open_capture(
             let dns = dns::DnsRedirect::new(cfg.dns.mode, &domains, hello.resolver, vip);
             Ok(Arc::new(capture::windivert::WinDivertCapture::open(
                 &processes, nodes, vip, mtu, dns,
+            )?))
+        }
+        #[cfg(windows)]
+        Mode::Tun => {
+            use capture::wintun::{Routing, WintunCapture};
+            let routes: Vec<_> = games
+                .iter()
+                .flat_map(|g| g.ip_ranges.iter().copied())
+                .chain(cfg.tun.routes.iter().copied())
+                .collect();
+            let routing = if cfg.tun.global {
+                Routing::Global
+            } else {
+                if routes.is_empty() {
+                    let names: Vec<&str> = games.iter().map(|g| g.name.as_str()).collect();
+                    bail!(
+                        "Wintun rules mode needs routes: set [[game]] ip_ranges (for templated \
+                         games `skyblock games --ranges NAME` prints them), [tun] routes, or \
+                         [tun] global = true (games: {names:?})"
+                    );
+                }
+                Routing::Rules(&routes)
+            };
+            Ok(Arc::new(WintunCapture::open(
+                &cfg.tun.name,
+                vip,
+                mtu,
+                routing,
+                nodes,
+                hello.resolver,
             )?))
         }
         #[cfg(target_os = "linux")]
@@ -371,7 +460,7 @@ fn status_loop(tunnel: &Tunnel, node: &str) -> Result<()> {
 }
 
 /// e.g. `[tokyo-1] up | rtt 42.1ms ±0.3 | loss up 0.8%/0.00% down 0.5%/0.00% rescued 3/2
-/// | up 128pps 0.2Mbps down 128pps 0.3Mbps | paths 2/2 [42.1 43.0] | flows 3 bulk 1`
+/// | up 128pps 0.2Mbps down 128pps 0.3Mbps | paths 2/2 [42.1 43.0] | copies 2/3 | flows 3 bulk 1`
 fn status_line(node: &str, prev: &Snapshot, cur: &Snapshot, eff: &EffLoss) -> String {
     if !cur.connected {
         return format!("[{node}] connecting");
@@ -393,7 +482,7 @@ fn status_line(node: &str, prev: &Snapshot, cur: &Snapshot, eff: &EffLoss) -> St
         .map(|p| format!("{:.1}", ms(p.rtt.srtt)))
         .collect();
     format!(
-        "[{node}] up | rtt {:.1}ms ±{:.1} | loss up {}/{} down {}/{} rescued {}/{} | up {}pps {:.1}Mbps down {}pps {:.1}Mbps | paths {}/{} [{}] | flows {} bulk {}",
+        "[{node}] up | rtt {:.1}ms ±{:.1} | loss up {}/{} down {}/{} rescued {}/{} | up {}pps {:.1}Mbps down {}pps {:.1}Mbps | paths {}/{} [{}] | copies {}/{} | flows {} bulk {}",
         ms(rtt),
         ms(var),
         pct(avg(|p| p.loss_out)),
@@ -409,6 +498,8 @@ fn status_line(node: &str, prev: &Snapshot, cur: &Snapshot, eff: &EffLoss) -> St
         up.len(),
         cur.paths.len(),
         rtts.join(" "),
+        cur.copies.0,
+        cur.copies.1,
         cur.flows,
         cur.bulk_flows,
     )

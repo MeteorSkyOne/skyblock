@@ -32,6 +32,14 @@ pub fn random_padding<R: Rng + ?Sized>(rng: &mut R, body_len: usize, max: usize)
     rng.random_range(0..=max.min(room))
 }
 
+/// Padding that brings a body of `body_len` to `target` bytes (none if it
+/// is already longer), limited to the room left.
+pub fn padding_towards(body_len: usize, target: usize) -> usize {
+    target
+        .saturating_sub(body_len)
+        .min(MAX_BODY.saturating_sub(body_len))
+}
+
 /// Padding that brings a handshake packet to a random total length in
 /// `[HANDSHAKE_LEN_MIN, HANDSHAKE_LEN_MAX]`.
 pub fn handshake_padding<R: Rng + ?Sized>(rng: &mut R, body_len: usize) -> usize {

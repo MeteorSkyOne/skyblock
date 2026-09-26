@@ -139,7 +139,21 @@ pub struct Tune {
     pub copy_delay_us: u32,
     pub bulk_enter_kbps: u32,
     pub bulk_exit_kbps: u32,
+    /// [`TUNE_NACK`]: request NACK retransmission (SPEC §4.5).
+    pub flags: u8,
+    /// Recent game items to carry along in each game packet (0 = off).
+    pub piggyback: u8,
+    /// Shape bulk flows towards the client to this rate (0 = off).
+    pub bulk_rate_kbps: u32,
 }
+
+/// `Tune::flags`: NACK retransmission in both directions.
+pub const TUNE_NACK: u8 = 1;
+
+/// `copy` of a data frame retransmitted after a NACK (SPEC §4.5).
+pub const RETX_COPY: u8 = 0xFF;
+/// `copy` of a data frame carried along in a later packet (piggybacking).
+pub const PIGGY_COPY: u8 = 0xFE;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct NackRange {
@@ -259,7 +273,7 @@ impl Frame<'_> {
                 1 + 2 + m.len()
             }
             Frame::Close(_) => 1 + 1,
-            Frame::Tune(_) => 1 + 1 + 1 + 4 + 4 + 4,
+            Frame::Tune(_) => 1 + 1 + 1 + 4 + 4 + 4 + 1 + 1 + 4,
         }
     }
 }
@@ -374,7 +388,10 @@ impl<'a> FrameWriter<'a> {
                     .u8(t.paths)
                     .u32(t.copy_delay_us)
                     .u32(t.bulk_enter_kbps)
-                    .u32(t.bulk_exit_kbps);
+                    .u32(t.bulk_exit_kbps)
+                    .u8(t.flags)
+                    .u8(t.piggyback)
+                    .u32(t.bulk_rate_kbps);
             }
             Frame::HsInit(m) => {
                 w.u8(ty::HS_INIT);
@@ -538,6 +555,9 @@ impl<'a> FrameReader<'a> {
                 copy_delay_us: r.u32()?,
                 bulk_enter_kbps: r.u32()?,
                 bulk_exit_kbps: r.u32()?,
+                flags: r.u8()?,
+                piggyback: r.u8()?,
+                bulk_rate_kbps: r.u32()?,
             }),
             ty::HS_INIT => Frame::HsInit(r.blob16()?),
             ty::HS_RESP => Frame::HsResp(r.blob16()?),
@@ -728,6 +748,9 @@ mod tests {
                 copy_delay_us: 2000,
                 bulk_enter_kbps: 2000,
                 bulk_exit_kbps: 1000,
+                flags: TUNE_NACK,
+                piggyback: 3,
+                bulk_rate_kbps: 40_000,
             }),
             Frame::HsInit(&[1; 108]),
             Frame::HsResp(&[2; 61]),

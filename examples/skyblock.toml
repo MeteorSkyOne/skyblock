@@ -5,7 +5,8 @@
 # `skyblock-server adduser`.
 private_key = "<your private key>"
 
-# windivert (Windows, per-process) | tun (Linux testbed)
+# windivert (Windows, per process) | tun (Windows: Wintun adapter, needs
+# wintun.dll next to skyblock.exe; Linux: TUN, used by the testbed)
 # mode = "windivert"
 # default_node = "tokyo-1"
 
@@ -20,7 +21,13 @@ public_key = "<node public key>"
 [tunnel]
 # paths = 2             # UDP sockets to the node (socket i uses ports[i % len])
 # copies = 2            # copies of each game packet, both directions (1 = off)
+# copies_max = 3        # under loss, up to this many (= copies: fixed)
 # copy_delay_ms = 2.0   # gap between copies
+# nack = true           # resend lost game packets on request (both directions)
+# piggyback = 0         # recent game packets carried in each one (0-8)
+# bulk_rate_mbps = 0    # node shapes downloads to this; set it a bit below
+#                       # your line's download speed to keep the game fast
+#                       # while downloading (0 = off)
 # mtu = 1400            # upper bound; the node's value wins if lower
 # pad_max = 48
 # bulk_enter_kbps = 2000  # flows faster than this for 1s get a single copy
@@ -32,13 +39,19 @@ public_key = "<node public key>"
 #        the node, the rest directly; all: every query; off: none.
 # mode = "rules"
 
-# Executable names as shown in Task Manager's "Details" tab. `domains`
-# only matter for [dns] mode = "rules".
+# mode = "tun" only: what goes into the tunnel.
+[tun]
+# global = false        # true: everything (Windows); DNS via the node too
+# routes = []           # extra ranges, on top of the games' ip_ranges
+
+# `skyblock games` lists built-in templates: naming one brings its process
+# names and domains along. Executable names are the ones in Task Manager's
+# "Details" tab; `domains` only matter for [dns] mode = "rules";
+# `ip_ranges` only for mode = "tun" without global (`skyblock games
+# --ranges NAME` prints them for games with their own network).
 [[game]]
 name = "cs2"
-process = ["cs2.exe"]
-# domains = ["steamserver.net"]
 
 [[game]]
 name = "valorant"
-process = ["VALORANT-Win64-Shipping.exe"]
+# process = ["VALORANT-Win64-Shipping.exe"]   # already in the template

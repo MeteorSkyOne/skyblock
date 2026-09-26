@@ -2,6 +2,7 @@
 //! and dedup windows, fragmentation, IPv4 rewriting. Pure logic, no I/O;
 //! see SPEC.md §3.
 
+pub mod adapt;
 pub mod dedup;
 pub mod dns;
 mod error;
@@ -12,6 +13,7 @@ pub mod handshake;
 pub mod ip;
 pub mod ipfrag;
 pub mod keys;
+pub mod nack;
 pub mod packet;
 pub mod path;
 pub mod replay;

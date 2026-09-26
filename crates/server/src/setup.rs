@@ -165,6 +165,8 @@ fn config_template(
 # udp_nat_timeout_s = 300
 # dns_upstream = []   # e.g. [\"1.1.1.1\"]; empty: /etc/resolv.conf
 # control_socket = \"/run/skyblock-server.sock\"   # for `skyblock-server status`
+# cpu = 1             # pin the node to this CPU
+# busy_poll = false   # true: never sleep (one core busy, lower wake-up latency)
 
 # Users are appended by `skyblock-server adduser`.
 ",

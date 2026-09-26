@@ -29,6 +29,10 @@ pub struct BenchArgs {
     pub copies: Vec<u8>,
     pub paths: Vec<u8>,
     pub delays_ms: Vec<f64>,
+    /// NACK retransmission and piggybacking are off unless asked for, so
+    /// that the settings compare redundancy alone.
+    pub nack: bool,
+    pub piggyback: u8,
 }
 
 #[derive(Default)]
@@ -173,6 +177,8 @@ fn run_one(
         copies: combo.copies,
         paths: combo.paths,
         copy_delay: (combo.delay_ms * 1000.0).round() as Micros,
+        nack: args.nack,
+        piggyback: args.piggyback,
         ..cfg.tunnel.policy()
     };
     tunnel.set_policy(policy);

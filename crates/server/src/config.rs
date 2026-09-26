@@ -44,6 +44,12 @@ struct RawConfig {
     /// Extra destinations clients may reach despite the default deny list.
     #[serde(default)]
     allow_destinations: Vec<Ipv4Net>,
+    /// Pin the process to this CPU (SPEC §7.1).
+    #[serde(default)]
+    cpu: Option<usize>,
+    /// Poll without sleeping: one core busy, lower wake-up latency.
+    #[serde(default)]
+    busy_poll: bool,
     #[serde(default)]
     user: Vec<RawUser>,
 }
@@ -124,6 +130,8 @@ pub struct Config {
     /// Unix socket `skyblock-server status` talks to.
     pub control_socket: PathBuf,
     pub allow_destinations: Vec<Ipv4Net>,
+    pub cpu: Option<usize>,
+    pub busy_poll: bool,
     pub users: Vec<UserConfig>,
 }
 
@@ -204,6 +212,8 @@ impl Config {
             dns_upstream,
             control_socket: raw.control_socket,
             allow_destinations: raw.allow_destinations,
+            cpu: raw.cpu,
+            busy_poll: raw.busy_poll,
             users,
         })
     }

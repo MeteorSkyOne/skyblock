@@ -114,6 +114,8 @@ struct Node {
     scratch: Vec<u8>,
     out: Vec<u8>,
     deliveries: Deliveries,
+    /// Poll with a zero timeout (`busy_poll`).
+    busy_poll: bool,
 }
 
 pub fn run(cfg: Config) -> Result<()> {
@@ -197,6 +199,9 @@ pub fn run(cfg: Config) -> Result<()> {
         cfg.subnet,
         cfg.gateway()
     );
+    if let Some(cpu) = cfg.cpu {
+        pin_to_cpu(cpu).with_context(|| format!("pinning to CPU {cpu}"))?;
+    }
     info!(
         public_key = %cfg.private_key.public_key(),
         ports = ?cfg.ports,
@@ -204,6 +209,8 @@ pub fn run(cfg: Config) -> Result<()> {
         %egress_ip,
         users = cfg.users.len(),
         dns_upstream = ?dns.upstreams(),
+        cpu = ?cfg.cpu,
+        busy_poll = cfg.busy_poll,
         "skyblock-server running"
     );
 
@@ -224,8 +231,27 @@ pub fn run(cfg: Config) -> Result<()> {
         scratch: vec![0u8; BUF_LEN],
         out: vec![0u8; BUF_LEN],
         deliveries: Deliveries::default(),
+        busy_poll: cfg.busy_poll,
     };
     node.run(&mut poll)
+}
+
+/// Keeps this (single-threaded) process on one CPU.
+fn pin_to_cpu(cpu: usize) -> io::Result<()> {
+    // SAFETY: a zeroed cpu_set_t is an empty set; CPU_SET stays within it
+    // for cpu < CPU_SETSIZE, which sched_setaffinity checks against the
+    // machine anyway.
+    unsafe {
+        let mut set: libc::cpu_set_t = std::mem::zeroed();
+        if cpu >= libc::CPU_SETSIZE as usize {
+            return Err(io::Error::from(io::ErrorKind::InvalidInput));
+        }
+        libc::CPU_SET(cpu, &mut set);
+        if libc::sched_setaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &set) != 0 {
+            return Err(io::Error::last_os_error());
+        }
+    }
+    Ok(())
 }
 
 impl Node {
@@ -255,7 +281,10 @@ impl Node {
                 timer.arm(deadline.saturating_sub(self.clock()));
                 armed = Some(deadline);
             }
-            if let Err(e) = poll.poll(&mut events, None) {
+            // Busy polling: never sleep in the kernel (the timerfd still
+            // shows up as an event on the next round).
+            let timeout = self.busy_poll.then_some(std::time::Duration::ZERO);
+            if let Err(e) = poll.poll(&mut events, timeout) {
                 if e.kind() == io::ErrorKind::Interrupted {
                     continue;
                 }
