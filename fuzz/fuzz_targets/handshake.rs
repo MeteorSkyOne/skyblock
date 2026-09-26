@@ -1,4 +1,4 @@
-//! Noise messages from the wire (SPEC §3.6): the node reading message 1,
+//! Noise messages from the wire: the node reading message 1,
 //! the client reading message 2. Both must reject garbage without panics.
 #![no_main]
 

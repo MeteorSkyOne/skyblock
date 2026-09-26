@@ -1,4 +1,4 @@
-//! Flow classification (SPEC §4.1): each side labels the flows it sends as
+//! Flow classification: each side labels the flows it sends as
 //! GAME (redundant copies) or BULK (single copy on a fixed path) by rate.
 
 use std::collections::HashMap;

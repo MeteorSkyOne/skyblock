@@ -1,4 +1,4 @@
-//! `sbtest`: traffic tools for the netns testbed (SPEC §10.3). Output is
+//! `sbtest`: traffic tools for the netns testbed. Output is
 //! `key=value` so scripts can parse it.
 
 use std::io::{Read, Write};

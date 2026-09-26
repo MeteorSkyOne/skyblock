@@ -1,4 +1,4 @@
-//! Wintun backend (SPEC §6.3): a virtual adapter whose address is the VIP.
+//! Wintun backend: a virtual adapter whose address is the VIP.
 //! Rules mode routes the games' `ip_ranges` (and `[tun] routes`) to it,
 //! global mode routes everything (`0.0.0.0/1` + `128.0.0.0/1`) and points
 //! the adapter's DNS at the node's resolver. Every node address keeps a

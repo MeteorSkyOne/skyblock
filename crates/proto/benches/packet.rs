@@ -1,4 +1,4 @@
-//! Hot-path micro-benchmarks (SPEC §9): packet seal/open, header rewrite,
+//! Hot-path micro-benchmarks: packet seal/open, header rewrite,
 //! dedup and a full encode+seal / open+decode round.
 
 use std::hint::black_box;

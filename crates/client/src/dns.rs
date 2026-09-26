@@ -1,4 +1,4 @@
-//! Sending DNS queries through the node (SPEC §6.5). Windows resolves
+//! Sending DNS queries through the node. Windows resolves
 //! names in the DNS Client service rather than in the game, so queries are
 //! picked by name: in `rules` mode those for the games' domains, in `all`
 //! mode every one.

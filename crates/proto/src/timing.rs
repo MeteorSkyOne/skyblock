@@ -1,4 +1,4 @@
-//! Protocol timers (SPEC §3.12), in microseconds.
+//! Protocol timers, in microseconds.
 
 use crate::Micros;
 
@@ -44,28 +44,28 @@ pub const SERVER_SESSION_EXPIRE: Micros = 180 * SECOND;
 
 pub const UDP_NAT_TIMEOUT: Micros = 300 * SECOND;
 
-/// In-channel rekey (SPEC §3.9): default interval, how long the client
+/// In-channel rekey: default interval, how long the client
 /// waits for `REKEY_RESP` before trying again, and how long a replaced
 /// receive keyset still opens late packets.
 pub const REKEY_INTERVAL: Micros = 600 * SECOND;
 pub const REKEY_RETRY: Micros = 3 * SECOND;
 pub const KEY_RETAIN: Micros = 30 * SECOND;
 
-/// Forwarded DNS queries are forgotten after this long (SPEC §7.5).
+/// Forwarded DNS queries are forgotten after this long.
 pub const DNS_TIMEOUT: Micros = 5 * SECOND;
 
 /// STATS interval while active / idle.
 pub const STATS_ACTIVE: Micros = SECOND;
 pub const STATS_IDLE: Micros = 10 * SECOND;
 
-/// Flow classification (SPEC §4.1): rate window, how long a bulk flow must
+/// Flow classification: rate window, how long a bulk flow must
 /// stay slow before it counts as a game flow again, and when an idle
 /// flow's state is dropped.
 pub const FLOW_WINDOW: Micros = SECOND;
 pub const BULK_EXIT_HOLD: Micros = 5 * SECOND;
 pub const FLOW_IDLE: Micros = 60 * SECOND;
 
-/// Path ranking (SPEC §3.8): score = srtt + JITTER_WEIGHT × rttvar +
+/// Path ranking: score = srtt + JITTER_WEIGHT × rttvar +
 /// LOSS_PENALTY × loss, and the margin a path must win by to replace the
 /// current best one.
 pub const JITTER_WEIGHT: Micros = 2;

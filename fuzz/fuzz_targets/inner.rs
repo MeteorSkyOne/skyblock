@@ -1,4 +1,4 @@
-//! Inner packets from clients (SPEC §6.4, §7.4, §7.5): IPv4 parsing and
+//! Inner packets from clients: IPv4 parsing and
 //! rewriting, IPv4 fragment reassembly and DNS query parsing.
 #![no_main]
 

@@ -1,6 +1,6 @@
 # Testbed
 
-Linux network namespaces + `tc netem` for the scenarios in SPEC §10.3.
+Linux network namespaces + `tc netem` for weak-network scenarios: loss, bursts, jitter, reordering.
 Runs on any Linux box with iproute2, including WSL2 (verified on Debian):
 
 ```sh

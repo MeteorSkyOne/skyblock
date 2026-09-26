@@ -1,4 +1,4 @@
-//! Static identity keys and per-direction packet keysets (SPEC §3.2–3.5).
+//! Static identity keys and per-direction packet keysets.
 //!
 //! Wire format of every packet:
 //!

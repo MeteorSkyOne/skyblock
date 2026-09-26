@@ -1,4 +1,4 @@
-//! The client's threads (SPEC §6.1): one receive thread per path socket, a
+//! The client's threads: one receive thread per path socket, a
 //! timer thread driving the core's timers and delayed copies, and the
 //! capture backend's threads feeding outbound packets. All share one
 //! [`ClientCore`] behind a mutex; I/O happens after the lock is released,

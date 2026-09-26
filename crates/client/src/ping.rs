@@ -1,4 +1,4 @@
-//! `skyblock ping` (SPEC §6.7, §8): handshakes with every node at once,
+//! `skyblock ping`: handshakes with every node at once,
 //! PINGs each path a few times and, given a target, has each node probe it
 //! (PROBE_REQ). Nodes are ranked by client→node plus node→target latency.
 //!

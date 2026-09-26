@@ -1,5 +1,5 @@
 //! Sliding bitmap window over a 64-bit counter (RFC 6479 style). Used
-//! directly as the packet-number replay window (SPEC §3.10).
+//! directly as the packet-number replay window.
 
 /// Counters older than `top - WINDOW` are rejected.
 pub const WINDOW: u64 = 4096;

@@ -1,4 +1,4 @@
-//! Packet capture backends (SPEC §6.2, §6.3). A backend hands outbound
+//! Packet capture backends. A backend hands outbound
 //! packets that belong in the tunnel to a sink, already addressed from the
 //! VIP, and injects packets coming back from the tunnel.
 

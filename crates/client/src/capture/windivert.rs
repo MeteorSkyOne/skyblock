@@ -1,4 +1,4 @@
-//! WinDivert per-process capture (SPEC §6.2).
+//! WinDivert per-process capture.
 //!
 //! Every outbound TCP/UDP packet to a public address passes through user
 //! space. Each flow (5-tuple) is decided once, on its first packet, and keeps

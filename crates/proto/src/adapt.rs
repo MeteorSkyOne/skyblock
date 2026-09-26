@@ -1,4 +1,4 @@
-//! Adaptive copy count (SPEC §4.5): the number of copies for one direction
+//! Adaptive copy count: the number of copies for one direction
 //! follows that direction's raw packet loss over the last 10s.
 //!
 //! With independent losses at rate `p`, `k` copies lose an item with

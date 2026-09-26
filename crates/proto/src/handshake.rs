@@ -1,4 +1,4 @@
-//! Noise `IKpsk2` session handshake (SPEC §3.6). This module produces and
+//! Noise `IKpsk2` session handshake. This module produces and
 //! consumes the Noise messages only; callers carry them in `HS_*` /
 //! `REKEY_*` frames, sealing handshake packets with
 //! [`SessionKeys::obfuscation`].

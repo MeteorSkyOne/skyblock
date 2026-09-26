@@ -1,5 +1,4 @@
-//! Packet layout constants, padding policy and a stack buffer helper
-//! (SPEC §3.3, §5).
+//! Packet layout constants, padding policy and a stack buffer helper.
 
 use rand::{Rng, RngExt};
 

@@ -1,4 +1,4 @@
-//! Server configuration (SPEC §7.9).
+//! Server configuration.
 
 use std::collections::HashSet;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
@@ -44,7 +44,7 @@ struct RawConfig {
     /// Extra destinations clients may reach despite the default deny list.
     #[serde(default)]
     allow_destinations: Vec<Ipv4Net>,
-    /// Pin the process to this CPU (SPEC §7.1).
+    /// Pin the process to this CPU.
     #[serde(default)]
     cpu: Option<usize>,
     /// Poll without sleeping: one core busy, lower wake-up latency.

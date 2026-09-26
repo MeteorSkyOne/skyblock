@@ -1,4 +1,4 @@
-//! Checks on inner packets sent by clients (SPEC §7.7): no spoofed sources,
+//! Checks on inner packets sent by clients: no spoofed sources,
 //! no reaching private, link-local (cloud metadata) or multicast ranges, nor
 //! the node itself except for UDP (which the NAT treats as hairpin). The
 //! one address inside the VIP subnet a client may use is the DNS resolver,
@@ -54,7 +54,7 @@ impl InnerFilter {
     }
 
     /// Lets clients send UDP to `resolver` port 53 (the node's DNS
-    /// forwarder, SPEC §7.5).
+    /// forwarder).
     pub fn with_resolver(mut self, resolver: Ipv4Addr) -> Self {
         self.resolver = Some(resolver);
         self

@@ -1,4 +1,4 @@
-//! Downlink shaping of bulk flows (SPEC §7.10): a token bucket below the
+//! Downlink shaping of bulk flows: a token bucket below the
 //! client's bottleneck with a queue in front of it. A download then queues
 //! here, where game packets pass it by, instead of in the bottleneck's
 //! buffer (the home line), where they would wait behind it.

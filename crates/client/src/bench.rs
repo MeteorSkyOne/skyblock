@@ -1,4 +1,4 @@
-//! `skyblock bench` (SPEC §6.7): sends echo requests at a game-like rate
+//! `skyblock bench`: sends echo requests at a game-like rate
 //! through the node for each combination of copies, paths and copy delay,
 //! and reports loss (raw per path and after redundancy), rescues and RTT.
 //! The raw loss per path shows whether redundancy itself draws ISP QoS:

@@ -1,4 +1,4 @@
-//! Transport-independent client logic (SPEC §3.6–3.9, §4): handshake with
+//! Transport-independent client logic: handshake with
 //! retries, per-path keepalive PINGs and RTT, moving silent paths to new
 //! sockets, in-channel rekeys, redundant sending with delayed copies, flow
 //! classification, the STATS exchange and dead-session detection. The
@@ -260,7 +260,7 @@ impl ClientCore {
     }
 
     /// Lets each direction's copy count follow its loss, between
-    /// `policy.copies` and `ceil` (SPEC §4.5).
+    /// `policy.copies` and `ceil`.
     pub fn with_adaptive_copies(mut self, ceil: u8) -> Self {
         self.adapt = Self::adaptive(self.policy.copies, ceil);
         self
@@ -905,7 +905,7 @@ impl ClientCore {
     }
 
     /// Starts an in-channel rekey when due, or repeats one that got no
-    /// answer (SPEC §3.9).
+    /// answer.
     fn poll_rekey(&mut self, now: Micros, io: &mut impl ClientIo) {
         let Some(s) = &mut self.session else { return };
         let due = match &s.rekey {
@@ -1010,7 +1010,7 @@ struct Interval {
 }
 
 /// What happened on the paths since `prev`, from our counters now and the
-/// node's in `st` (SPEC §4.4). Packets in flight make single intervals
+/// node's in `st`. Packets in flight make single intervals
 /// err either way; the adaptive window sums them out.
 fn interval(prev: &Exchange, s: &Session, st: &Stats) -> Interval {
     let mut c = Interval {

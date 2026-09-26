@@ -1,4 +1,4 @@
-# skyblock client configuration (SPEC §6.8).
+# skyblock client configuration.
 # Put this file next to skyblock.exe (or pass -c <path>).
 
 # From `skyblock keygen`; give the printed public key to each node's

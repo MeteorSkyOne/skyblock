@@ -1,4 +1,4 @@
-//! User-space full-cone UDP NAT (SPEC §7.4). Each `(user, inner source
+//! User-space full-cone UDP NAT. Each `(user, inner source
 //! port)` gets its own public UDP socket; anything arriving on that socket,
 //! from any address, is forwarded back to the user (endpoint-independent
 //! mapping and filtering).

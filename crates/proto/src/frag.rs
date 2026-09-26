@@ -1,5 +1,5 @@
 //! Splitting oversized IP packets into `IP_FRAG` chunks and reassembling
-//! them (SPEC §3.11). Fragments of one packet use consecutive sequence
+//! them. Fragments of one packet use consecutive sequence
 //! numbers, so the group is identified by `seq - idx`.
 
 use crate::{Error, Micros};

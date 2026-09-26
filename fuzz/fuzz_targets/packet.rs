@@ -1,4 +1,4 @@
-//! The receive path (SPEC §3.3–3.11): arbitrary datagrams against the
+//! The receive path: arbitrary datagrams against the
 //! session and handshake keysets, and arbitrary *authentic* bodies (sealed
 //! here) through frame parsing, dedup and IP_FRAG reassembly.
 #![no_main]

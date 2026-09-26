@@ -1,6 +1,6 @@
 //! Per-direction session state shared by client and server: sealing data
 //! and control packets on the way out, authentication, replay protection,
-//! dedup and reassembly on the way in (SPEC §3.7–3.11, §4.3).
+//! dedup and reassembly on the way in.
 
 use rand::rngs::StdRng;
 use rand::{Rng, RngExt, SeedableRng};
@@ -23,12 +23,12 @@ use crate::{Error, Micros};
 
 /// Concurrent reassemblies kept per session.
 const REASSEMBLY_SLOTS: usize = 16;
-/// Recent game packet lengths that control packets imitate (SPEC §5).
+/// Recent game packet lengths that control packets imitate.
 const LEN_SAMPLES: usize = 16;
 /// Control packets land within this many bytes of the length they imitate.
 const CONTROL_LEN_JITTER: usize = 16;
 
-/// How a data packet is padded (SPEC §5).
+/// How a data packet is padded.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Pad {
     /// `[0, pad_max]`, and the length is remembered for control packets
@@ -78,7 +78,7 @@ impl TxState {
         self.items
     }
 
-    /// Switches to a new keyset (in-channel rekey, SPEC §3.9). Packet
+    /// Switches to a new keyset (in-channel rekey). Packet
     /// numbers restart at 0; data sequence numbers carry on.
     pub fn rekey(&mut self, keys: Keyset) {
         self.keys = keys;
@@ -115,7 +115,7 @@ impl TxState {
 
     /// [`send_ip`](Self::send_ip) with a padding mode and, when `ip` fits
     /// one frame, other data frames carried along in the same packet as
-    /// far as they fit (piggybacking, SPEC §4.5).
+    /// far as they fit (piggybacking).
     pub fn send_ip_with(
         &mut self,
         ip: &[u8],
@@ -343,7 +343,7 @@ impl RxKeys {
 }
 
 /// Receiving half: authentication, replay windows, dedup, reassembly.
-/// Around a rekey it holds up to three keysets (SPEC §3.9): the current
+/// Around a rekey it holds up to three keysets: the current
 /// one, the peer's next one (which becomes current with the first packet
 /// sealed under it) and the previous one, kept for late packets until
 /// `KEY_RETAIN` after the switch.
@@ -382,7 +382,7 @@ impl RxState {
         self.nack_wait = wait;
     }
 
-    /// Gaps due for a NACK by `now` (SPEC §4.5), into `out`.
+    /// Gaps due for a NACK by `now`, into `out`.
     pub fn nacks(&mut self, now: Micros, out: &mut Vec<NackRange>) {
         let dedup = &self.dedup;
         self.gaps.due(now, |s| dedup.check(s) == Seen::New, out);
@@ -495,7 +495,7 @@ impl RxState {
 }
 
 /// Seals a handshake frame under an obfuscation keyset, with a random
-/// packet number and handshake padding (SPEC §3.6).
+/// packet number and handshake padding.
 pub fn seal_handshake<'b, R: Rng + ?Sized>(
     keys: &Keyset,
     frame: &Frame<'_>,

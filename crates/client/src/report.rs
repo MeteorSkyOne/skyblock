@@ -1,4 +1,4 @@
-//! Loss arithmetic over two `STATS` exchanges (SPEC §4.4), shared by the
+//! Loss arithmetic over two `STATS` exchanges, shared by the
 //! `up` status line and `bench`.
 
 use crate::core::Exchange;

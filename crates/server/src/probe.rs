@@ -1,4 +1,4 @@
-//! Latency probes the node runs on a client's behalf (SPEC §7.6): ICMP
+//! Latency probes the node runs on a client's behalf: ICMP
 //! echo over a raw socket, or TCP connects, where both a SYN-ACK and a RST
 //! count as a reply. Each probe sends `count` pings `interval` apart and
 //! reports once every ping was answered or timed out.

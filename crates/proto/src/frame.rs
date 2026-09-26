@@ -1,4 +1,4 @@
-//! Frame codec (SPEC §3.7). A packet body is a sequence of frames followed
+//! Frame codec. A packet body is a sequence of frames followed
 //! by optional padding; a `PADDING` type byte ends the frame list.
 
 use std::net::Ipv4Addr;
@@ -90,7 +90,7 @@ pub struct PathStats {
     pub rttvar_us: u32,
 }
 
-/// Cumulative counters, sent about once a second (SPEC §4.4).
+/// Cumulative counters, sent about once a second.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct Stats {
     /// Data items (sequence numbers) sent.
@@ -129,8 +129,8 @@ impl Stats {
     }
 }
 
-/// Redundancy policy the client asks the node to use towards it (SPEC
-/// §4.2). Idempotent; the client repeats it with each of its `STATS`.
+/// Redundancy policy the client asks the node to use towards it.
+/// Idempotent; the client repeats it with each of its `STATS`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Tune {
     pub copies: u8,
@@ -139,7 +139,7 @@ pub struct Tune {
     pub copy_delay_us: u32,
     pub bulk_enter_kbps: u32,
     pub bulk_exit_kbps: u32,
-    /// [`TUNE_NACK`]: request NACK retransmission (SPEC §4.5).
+    /// [`TUNE_NACK`]: request NACK retransmission.
     pub flags: u8,
     /// Recent game items to carry along in each game packet (0 = off).
     pub piggyback: u8,
@@ -150,7 +150,7 @@ pub struct Tune {
 /// `Tune::flags`: NACK retransmission in both directions.
 pub const TUNE_NACK: u8 = 1;
 
-/// `copy` of a data frame retransmitted after a NACK (SPEC §4.5).
+/// `copy` of a data frame retransmitted after a NACK.
 pub const RETX_COPY: u8 = 0xFF;
 /// `copy` of a data frame carried along in a later packet (piggybacking).
 pub const PIGGY_COPY: u8 = 0xFE;

@@ -1,4 +1,4 @@
-//! Data-sequence dedup window (SPEC §3.10). Sequence numbers are 32-bit and
+//! Data-sequence dedup window. Sequence numbers are 32-bit and
 //! wrap; they are unwrapped against the highest one seen and tracked in a
 //! [`SlidingWindow`].
 

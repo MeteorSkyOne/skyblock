@@ -1,4 +1,4 @@
-//! System integration (SPEC §7.3, §7.8): egress detection, nftables and
+//! System integration: egress detection, nftables and
 //! sysctl, `init` and `adduser`.
 
 use std::fmt::Write as _;
@@ -147,7 +147,7 @@ fn config_template(
         .collect::<Vec<_>>()
         .join(", ");
     let mut text = String::new();
-    writeln!(text, "# skyblock-server configuration (SPEC §7.9)")?;
+    writeln!(text, "# skyblock-server configuration")?;
     writeln!(text, "private_key = \"{}\"", key.to_base64())?;
     writeln!(text, "# public_key = \"{}\"", key.public_key())?;
     writeln!(text, "ports = [{ports}]")?;

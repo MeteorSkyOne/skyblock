@@ -1,5 +1,5 @@
-//! Precise sleeping for the client's timer thread and `bench` pacing
-//! (SPEC §6.1): wait until a deadline or until another thread calls
+//! Precise sleeping for the client's timer thread and `bench` pacing:
+//! wait until a deadline or until another thread calls
 //! [`Waiter::wake`]. On Windows this is a high-resolution waitable timer
 //! (`CREATE_WAITABLE_TIMER_HIGH_RESOLUTION`) plus an event; elsewhere a
 //! condition variable, whose timeouts are already precise on Linux.

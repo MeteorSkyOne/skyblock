@@ -1,4 +1,4 @@
-//! Address rewriting for packets captured on the host (SPEC §6.4). The
+//! Address rewriting for packets captured on the host. The
 //! game's packets leave with its LAN address as the source; the tunnel
 //! carries them with the VIP instead and restores the LAN address on the
 //! way back, keyed by `(protocol, local port)`. IP fragments after the

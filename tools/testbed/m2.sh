@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# M2 checks in the netns testbed (SPEC §10.3): redundancy over two paths.
+# M2 checks in the netns testbed: redundancy over two paths.
 #   S2  random loss 1% / 5%: effective loss with 1 vs 2 copies (bench)
 #   S3  burst loss (Gilbert-Elliott): copies and copy delay (bench, report)
 #   S4  jitter and reordering: no duplicates reach the app (up + udp-ping)

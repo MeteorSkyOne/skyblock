@@ -1,4 +1,4 @@
-//! Which process owns a local port (SPEC §6.2), from WinDivert socket
+//! Which process owns a local port, from WinDivert socket
 //! events and, on a miss, the system TCP/UDP tables (IPv4 and IPv6, since
 //! games often use dual-stack sockets for IPv4 traffic).
 

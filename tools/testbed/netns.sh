@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Network-namespace testbed for skyblock (SPEC §10.3).
+# Network-namespace testbed for skyblock.
 #
 #   sb-client  wan0 198.18.0.2/24 ──┐  netem on both wan0 egresses
 #   sb-server  wan0 198.18.0.1/24 ──┘
@@ -77,7 +77,7 @@ down() {
     done
 }
 
-# Profiles map to the scenarios in SPEC §10.3.
+# netem profiles, applied to wan0 in both namespaces.
 netem() {
     local profile=${1:-}
     local args

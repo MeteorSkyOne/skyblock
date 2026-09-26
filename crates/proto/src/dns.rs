@@ -1,5 +1,5 @@
 //! Just enough DNS (RFC 1035) to route queries: the transaction ID, the QR
-//! flag and the first question's name (SPEC §6.5, §7.5). Nothing here
+//! flag and the first question's name. Nothing here
 //! allocates; names are decoded into a stack buffer.
 
 pub const PORT: u16 = 53;

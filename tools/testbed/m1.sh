@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# M1 end-to-end checks in the netns testbed (SPEC §10.3):
+# M1 end-to-end checks in the netns testbed:
 #   S1  added latency, tunnel vs direct (UDP and TCP)
 #   S9  full-cone NAT: a third party reaches the client's mapping
 #   S10 junk sent to the node gets no response

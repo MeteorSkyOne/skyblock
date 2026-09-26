@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# M4 checks in the netns testbed (SPEC §10.3):
+# M4 checks in the netns testbed:
 #   A1  adaptive copies: 5% loss raises both directions to 3 copies, a
 #       clean link brings them back to 2
 #   N1  NACK fast retransmission with a single copy under 5% loss

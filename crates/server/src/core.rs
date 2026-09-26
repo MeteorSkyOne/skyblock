@@ -1,4 +1,4 @@
-//! Transport-independent server logic (SPEC §3.6–3.9, §4, §7.2): handshakes,
+//! Transport-independent server logic: handshakes,
 //! in-channel rekeys, sessions, paths, redundant sending and frame
 //! handling. The event loop feeds datagrams in and performs the I/O
 //! requested through [`ServerIo`].
@@ -881,7 +881,7 @@ pub fn duration(us: Micros) -> String {
     }
 }
 
-/// Handles REKEY_INIT (SPEC §3.9): a fresh IKpsk2 message 1 from the same
+/// Handles REKEY_INIT: a fresh IKpsk2 message 1 from the same
 /// client key. Returns message 2, which the caller sends in REKEY_RESP
 /// under the current keys, and stages the new keys: receiving ones as
 /// `next`, sending ones until the client uses its new keys.

@@ -1,4 +1,4 @@
-//! Redundant sending (SPEC §4.2, §4.5). Copy 0 of a data item goes out at
+//! Redundant sending. Copy 0 of a data item goes out at
 //! once on the best path; copy `c` follows `c × copy_delay` later on the
 //! `c`-th path of the ranking. Every copy is a separate packet with its own
 //! PN and padding, sealed when it is sent. Recent game items are kept for

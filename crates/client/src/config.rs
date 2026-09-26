@@ -1,4 +1,4 @@
-//! Client configuration (SPEC §6.8).
+//! Client configuration.
 
 use std::collections::HashSet;
 use std::net::Ipv4Addr;
@@ -75,12 +75,12 @@ pub struct TunnelConfig {
     /// Upper bound on the inner MTU; the node's value wins if lower.
     pub mtu: u16,
     pub pad_max: usize,
-    /// Flow classification thresholds (SPEC §4.1).
+    /// Flow classification thresholds.
     pub bulk_enter_kbps: u32,
     pub bulk_exit_kbps: u32,
-    /// In-channel rekey interval (SPEC §3.9); 0 turns rekeying off.
+    /// In-channel rekey interval; 0 turns rekeying off.
     pub rekey_interval_s: u64,
-    /// Adaptive copies (SPEC §4.5): up to this many under loss, `copies`
+    /// Adaptive copies: up to this many under loss, `copies`
     /// being the floor; unset = max(copies, 3), equal to `copies` = off.
     pub copies_max: Option<u8>,
     /// NACK fast retransmission, both directions.
@@ -194,7 +194,7 @@ pub struct GameConfig {
     #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     pub ip_ranges: Vec<Ipv4Net>,
     /// Domains (and their subdomains) resolved through the node when
-    /// `[dns] mode = "rules"` (SPEC §6.5).
+    /// `[dns] mode = "rules"`.
     #[serde(default)]
     #[cfg_attr(not(windows), allow(dead_code))]
     pub domains: Vec<String>,
@@ -217,7 +217,7 @@ fn with_template(mut g: GameConfig) -> GameConfig {
     g
 }
 
-/// Which DNS queries go through the node (SPEC §6.5).
+/// Which DNS queries go through the node.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum DnsMode {
@@ -241,7 +241,7 @@ pub struct TunConfig {
     pub name: String,
     /// Extra routes into the tunnel, on top of the games' `ip_ranges`.
     pub routes: Vec<Ipv4Net>,
-    /// Everything into the tunnel (Wintun global mode, SPEC §6.3).
+    /// Everything into the tunnel (Wintun global mode).
     #[cfg_attr(not(windows), allow(dead_code))]
     pub global: bool,
 }
@@ -355,7 +355,7 @@ impl Config {
 
     /// The named games, or all of them when `names` is empty.
     /// The games to accelerate: `names`, or every configured game. A
-    /// game named like a built-in template (SPEC §6.8) gets its processes
+    /// game named like a built-in template gets its processes
     /// and domains added; a name that is only a template works as is.
     pub fn games(&self, names: &[String]) -> Result<Vec<GameConfig>> {
         if names.is_empty() {

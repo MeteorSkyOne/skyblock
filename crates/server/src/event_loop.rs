@@ -1,4 +1,4 @@
-//! Linux event loop (SPEC §7.1): one mio thread multiplexing the tunnel
+//! Linux event loop: one mio thread multiplexing the tunnel
 //! sockets, the TUN device, the NAT sockets, the DNS upstream socket, the
 //! probe sockets and the control socket for `status`.
 

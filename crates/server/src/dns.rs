@@ -1,4 +1,4 @@
-//! DNS forwarding for the resolver VIP (SPEC §7.5). A client's query to
+//! DNS forwarding for the resolver VIP. A client's query to
 //! `resolver:53` leaves the node from one upstream socket under a fresh
 //! transaction ID; the answer gets the client's ID back and returns as a
 //! UDP packet from `resolver:53`. No caching. This module does no I/O.

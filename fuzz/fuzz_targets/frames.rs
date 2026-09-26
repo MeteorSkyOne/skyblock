@@ -1,4 +1,4 @@
-//! Frame parsing (SPEC §3.7) on arbitrary bodies: never panics, and every
+//! Frame parsing on arbitrary bodies: never panics, and every
 //! frame that parses re-encodes to the same bytes.
 #![no_main]
 

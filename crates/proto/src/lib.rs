@@ -1,6 +1,5 @@
 //! skyblock wire protocol: keys, packet sealing, frames, handshake, replay
-//! and dedup windows, fragmentation, IPv4 rewriting. Pure logic, no I/O;
-//! see SPEC.md §3.
+//! and dedup windows, fragmentation, IPv4 rewriting. Pure logic, no I/O.
 
 pub mod adapt;
 pub mod dedup;

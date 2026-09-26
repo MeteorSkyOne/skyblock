@@ -1,4 +1,4 @@
-//! Built-in game templates (SPEC §6.8): process names, domains and the
+//! Built-in game templates: process names, domains and the
 //! networks (ASNs) that host a game's servers, so that a `[[game]]` entry,
 //! or `--game`, can just name the game.
 //!

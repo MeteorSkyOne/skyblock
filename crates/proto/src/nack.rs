@@ -1,4 +1,4 @@
-//! NACK fast retransmission, receiving side (SPEC §4.5): notes the data
+//! NACK fast retransmission, receiving side: notes the data
 //! sequence numbers skipped by each new highest one and, once a gap has
 //! stayed open for the wait (copies and cross-path reordering had their
 //! chance), reports it for a `NACK`.

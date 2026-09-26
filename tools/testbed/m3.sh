@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# M3 checks in the netns testbed (SPEC §10.3):
+# M3 checks in the netns testbed:
 #   D1  DNS through the resolver VIP (node-side forwarding)
 #   F1  oversized UDP both ways: inner IPv4 fragments reassembled by the
 #       node, answers carried in IP_FRAG frames

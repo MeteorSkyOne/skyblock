@@ -1,6 +1,6 @@
 //! Reassembly of IPv4 fragments (RFC 791 §3.2). The node's user-space UDP
 //! NAT needs whole datagrams, so inner UDP that a game fragmented itself is
-//! put back together first (SPEC §7.4). Overlapping fragments drop the
+//! put back together first. Overlapping fragments drop the
 //! whole datagram, as they only come from broken or hostile senders.
 
 use std::net::Ipv4Addr;

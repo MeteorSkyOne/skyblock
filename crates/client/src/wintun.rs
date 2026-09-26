@@ -1,4 +1,4 @@
-//! Wintun FFI (SPEC §6.3), loaded at run time from `wintun.dll` next to
+//! Wintun FFI, loaded at run time from `wintun.dll` next to
 //! skyblock.exe, and the IP Helper calls that give the adapter its
 //! address, MTU and routes.
 

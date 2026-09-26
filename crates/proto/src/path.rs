@@ -1,4 +1,4 @@
-//! Path quality and ranking (SPEC §3.8, §4.4). Both sides count packets
+//! Path quality and ranking. Both sides count packets
 //! per path and exchange the counters in `STATS`; loss towards the peer
 //! follows from the peer's receive count, loss from the peer from its send
 //! count. Paths are ranked by `srtt + 2 × rttvar + LOSS_PENALTY × loss`.

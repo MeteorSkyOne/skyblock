@@ -1,4 +1,4 @@
-//! Thread priority for hot-path threads (SPEC §6.1): MMCSS "Games" on
+//! Thread priority for hot-path threads: MMCSS "Games" on
 //! Windows, falling back to `THREAD_PRIORITY_TIME_CRITICAL`. No-op
 //! elsewhere.
 
