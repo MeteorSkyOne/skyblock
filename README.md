@@ -11,8 +11,6 @@ Windows 游戏机 ──(家宽)──> 节点（Linux VPS）──> 游戏服�
 - TCP、UDP、ICMP 都能走；节点的 UDP 是 Full Cone NAT，P2P 游戏里 NAT 类型为开放。
 - 节点对没通过认证的包一律不回应。
 
-设计和实测数据都在 [SPEC.md](SPEC.md)，本文只讲怎么用。
-
 ## 依赖
 
 节点和客户端要用同一版代码构建，协议变了就一起升级（例如 M3 和 M4 不能互通）。
@@ -276,4 +274,4 @@ cargo clippy --all-targets
 cargo +nightly fuzz run frames   # Linux 上；目标还有 packet、handshake、inner
 ```
 
-集成测试床用 Linux 网络命名空间和 `tc netem` 模拟丢包、抖动、断流，WSL2 里也能跑，见 [tools/testbed/README.md](tools/testbed/README.md)。改代码前先改 [SPEC.md](SPEC.md)。
+集成测试床用 Linux 网络命名空间和 `tc netem` 模拟丢包、抖动、断流，WSL2 里也能跑，见 [tools/testbed/README.md](tools/testbed/README.md)。
