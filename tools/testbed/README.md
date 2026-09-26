@@ -33,6 +33,8 @@ testbed down on exit:
 |---|---|
 | `m1.sh` | S1 added latency, S9 full cone, S10 probe, S12 inner filter |
 | `m2.sh` | S2 random loss, S3 burst loss, S4 jitter/reorder, S5 path failure, S8 bulk + game |
+| `m3.sh` | D1 DNS, F1 IP fragments, S6 rebinding / address change, S7 rekeying, P1 `skyblock ping`, ST `status`, S9 node restart |
+| `m4.sh` | A1 adaptive copies, N1 NACK, P1 piggyback, B1 bulk shaping, BP busy polling |
 | `weak.sh` | W1 heavy loss, W2 large jitter, W3 heavy reordering, W4 all combined, W5 loss bursts, W6 one bad path, W7 short blackouts |
 
 `m2.sh` runs `skyblock bench` as a second user next to `up`;
