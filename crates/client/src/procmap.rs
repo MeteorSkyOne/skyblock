@@ -276,7 +276,8 @@ mod tests {
     #[test]
     fn finds_our_own_sockets() {
         let udp = UdpSocket::bind("127.0.0.1:0").unwrap();
-        let tcp = TcpListener::bind("[::]:0").unwrap();
+        // Loopback only: a wildcard listener makes Windows Firewall prompt.
+        let tcp = TcpListener::bind("[::1]:0").unwrap();
         let me = std::env::current_exe().unwrap();
         let name = me.file_name().unwrap().to_string_lossy().to_string();
 
