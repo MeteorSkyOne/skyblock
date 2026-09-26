@@ -82,6 +82,11 @@ impl Nat {
         self.by_key.len()
     }
 
+    /// Mappings owned by `user`.
+    pub fn user_mappings(&self, user: usize) -> usize {
+        self.per_user.get(&user).copied().unwrap_or(0)
+    }
+
     /// Maps a token back to a slot, if it is one of ours.
     pub fn slot_for(token: Token) -> Option<usize> {
         token.0.checked_sub(TOKEN_BASE)

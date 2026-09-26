@@ -2,9 +2,13 @@ mod bench;
 mod capture;
 mod config;
 mod core;
-// Only the WinDivert backend rewrites addresses; built everywhere for tests.
+// Only the WinDivert backend rewrites addresses and redirects DNS; built
+// everywhere for tests.
+#[cfg_attr(not(windows), allow(dead_code))]
+mod dns;
 #[cfg_attr(not(windows), allow(dead_code))]
 mod flows;
+mod ping;
 #[cfg(windows)]
 mod procmap;
 mod report;
@@ -19,6 +23,7 @@ use std::time::Duration;
 
 use anyhow::{Result, bail};
 use clap::{Parser, Subcommand};
+use skyblock_proto::frame::ProbeKind;
 use skyblock_proto::keys::PrivateKey;
 use tracing::{Level, info};
 
@@ -26,6 +31,7 @@ use crate::bench::BenchArgs;
 use crate::capture::Capture;
 use crate::config::{Config, GameConfig, Mode};
 use crate::core::{ClientCore, Snapshot};
+use crate::ping::PingArgs;
 use crate::report::{Interval, pct};
 use crate::tunnel::Tunnel;
 
@@ -58,6 +64,27 @@ enum Command {
         /// Capture mode (default: from the config / platform).
         #[arg(long, value_parser = parse_mode)]
         mode: Option<Mode>,
+    },
+    /// Handshake with every node, measure the latency to each, and
+    /// optionally have each node measure its latency to a game server;
+    /// ranks the nodes by the total. Replaces a running `up` session with
+    /// the same key on each node, so run it before `up`.
+    Ping {
+        #[arg(short, long, default_value = "skyblock.toml")]
+        config: PathBuf,
+        /// Nodes to test (default: all).
+        #[arg(long = "node")]
+        nodes: Vec<String>,
+        /// Have each node measure its latency to this address.
+        #[arg(long)]
+        target: Option<Ipv4Addr>,
+        /// How nodes probe the target: icmp, or tcp:PORT (a reply is the
+        /// SYN-ACK or the RST).
+        #[arg(long, default_value = "icmp", value_parser = parse_probe)]
+        probe: (ProbeKind, u16),
+        /// PINGs per path, and probe pings per node (1-20).
+        #[arg(long, default_value_t = 10)]
+        count: u8,
     },
     /// Measure loss and latency through a node for several redundancy
     /// settings. Replaces a running `up` session with the same key.
@@ -95,6 +122,17 @@ fn parse_mode(s: &str) -> Result<Mode, String> {
         "windivert" => Ok(Mode::Windivert),
         "tun" => Ok(Mode::Tun),
         _ => Err("expected `windivert` or `tun`".into()),
+    }
+}
+
+fn parse_probe(s: &str) -> Result<(ProbeKind, u16), String> {
+    match s.split_once(':') {
+        None if s == "icmp" => Ok((ProbeKind::Icmp, 0)),
+        Some(("tcp", port)) => match port.parse() {
+            Ok(p) if p > 0 => Ok((ProbeKind::Tcp, p)),
+            _ => Err(format!("bad port in `{s}`")),
+        },
+        _ => Err("expected `icmp` or `tcp:PORT`".into()),
     }
 }
 
@@ -150,6 +188,26 @@ fn main() -> Result<()> {
             games,
             mode,
         } => up(&config, node.as_deref(), &games, mode),
+        Command::Ping {
+            config,
+            nodes,
+            target,
+            probe,
+            count,
+        } => {
+            if !(1..=20).contains(&count) {
+                bail!("--count must be within 1..=20");
+            }
+            let cfg = Config::load(&config)?;
+            let args = PingArgs {
+                nodes,
+                target,
+                kind: probe.0,
+                port: probe.1,
+                count,
+            };
+            ping::run(&cfg, &args)
+        }
         Command::Bench {
             config,
             node,
@@ -206,7 +264,8 @@ fn up(
         cfg.tunnel.pad_max,
         cfg.tunnel.paths,
         cfg.tunnel.policy(),
-    );
+    )
+    .with_rekey_interval(cfg.tunnel.rekey_interval());
     info!(
         node = %node.name,
         addr = %node.addr,
@@ -221,7 +280,7 @@ fn up(
     let mtu = hello.mtu.min(cfg.tunnel.mtu);
 
     let nodes: Vec<Ipv4Addr> = cfg.nodes.iter().map(|n| n.addr).collect();
-    let capture = open_capture(mode, &cfg, &games, &nodes, hello.vip, mtu)?;
+    let capture = open_capture(mode, &cfg, &games, &nodes, &hello, mtu)?;
     tunnel.set_capture(Arc::clone(&capture));
     let t = Arc::clone(&tunnel);
     capture.start(Arc::new(move |pkt: &mut [u8]| t.send_ip(pkt)))?;
@@ -240,9 +299,10 @@ fn open_capture(
     cfg: &Config,
     games: &[&GameConfig],
     nodes: &[Ipv4Addr],
-    vip: Ipv4Addr,
+    hello: &skyblock_proto::handshake::ServerHello,
     mtu: u16,
 ) -> Result<Arc<dyn Capture>> {
+    let vip = hello.vip;
     match mode {
         #[cfg(windows)]
         Mode::Windivert => {
@@ -250,8 +310,10 @@ fn open_capture(
             if processes.is_empty() {
                 bail!("no game processes configured ([[game]] process = [...])");
             }
+            let domains: Vec<String> = games.iter().flat_map(|g| g.domains.clone()).collect();
+            let dns = dns::DnsRedirect::new(cfg.dns.mode, &domains, hello.resolver, vip);
             Ok(Arc::new(capture::windivert::WinDivertCapture::open(
-                &processes, nodes, vip, mtu,
+                &processes, nodes, vip, mtu, dns,
             )?))
         }
         #[cfg(target_os = "linux")]
@@ -269,6 +331,7 @@ fn open_capture(
                 vip,
                 mtu,
                 &routes,
+                hello.resolver,
             )?))
         }
         #[allow(unreachable_patterns)]
@@ -367,5 +430,9 @@ mod tests {
         assert_eq!(parse_size("200"), Ok((200, 200)));
         assert!(parse_size("300-100").is_err());
         assert!(parse_size("2000").is_err());
+        assert_eq!(parse_probe("icmp"), Ok((ProbeKind::Icmp, 0)));
+        assert_eq!(parse_probe("tcp:443"), Ok((ProbeKind::Tcp, 443)));
+        assert!(parse_probe("tcp:0").is_err());
+        assert!(parse_probe("udp:53").is_err());
     }
 }

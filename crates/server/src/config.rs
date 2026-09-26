@@ -1,9 +1,9 @@
 //! Server configuration (SPEC §7.9).
 
 use std::collections::HashSet;
-use std::net::{IpAddr, Ipv4Addr};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::ops::RangeInclusive;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail, ensure};
 use ipnet::Ipv4Net;
@@ -15,6 +15,7 @@ use skyblock_proto::timing::SECOND;
 pub const DEFAULT_SUBNET: &str = "10.77.0.0/16";
 pub const DEFAULT_MTU: u16 = 1400;
 pub const DEFAULT_TUN: &str = "sb0";
+pub const DEFAULT_CONTROL_SOCKET: &str = "/run/skyblock-server.sock";
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -35,6 +36,11 @@ struct RawConfig {
     nat_port_range: [u16; 2],
     #[serde(default = "default_nat_timeout")]
     udp_nat_timeout_s: u64,
+    /// DNS servers the resolver VIP forwards to; empty = /etc/resolv.conf.
+    #[serde(default)]
+    dns_upstream: Vec<DnsServer>,
+    #[serde(default = "default_control_socket")]
+    control_socket: PathBuf,
     /// Extra destinations clients may reach despite the default deny list.
     #[serde(default)]
     allow_destinations: Vec<Ipv4Net>,
@@ -49,6 +55,27 @@ struct RawUser {
     public_key: String,
     psk: Option<String>,
     vip: Ipv4Addr,
+}
+
+/// `"1.1.1.1"` or `"1.1.1.1:5353"`.
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum DnsServer {
+    Addr(SocketAddr),
+    Ip(IpAddr),
+}
+
+impl DnsServer {
+    fn addr(&self) -> SocketAddr {
+        match *self {
+            DnsServer::Addr(a) => a,
+            DnsServer::Ip(ip) => SocketAddr::new(ip, 53),
+        }
+    }
+}
+
+fn default_control_socket() -> PathBuf {
+    PathBuf::from(DEFAULT_CONTROL_SOCKET)
 }
 
 fn default_listen_ip() -> IpAddr {
@@ -93,6 +120,9 @@ pub struct Config {
     pub mtu: u16,
     pub nat_port_range: RangeInclusive<u16>,
     pub udp_nat_timeout: Micros,
+    pub dns_upstream: Vec<SocketAddr>,
+    /// Unix socket `skyblock-server status` talks to.
+    pub control_socket: PathBuf,
     pub allow_destinations: Vec<Ipv4Net>,
     pub users: Vec<UserConfig>,
 }
@@ -113,6 +143,11 @@ impl Config {
         );
         let [lo, hi] = raw.nat_port_range;
         ensure!(lo >= 1024 && lo <= hi, "bad `nat_port_range`");
+        let dns_upstream: Vec<SocketAddr> = raw.dns_upstream.iter().map(DnsServer::addr).collect();
+        ensure!(
+            dns_upstream.iter().all(SocketAddr::is_ipv4),
+            "`dns_upstream` must be IPv4 addresses"
+        );
 
         let subnet = raw.subnet.trunc();
         let gateway = gateway_addr(subnet);
@@ -166,6 +201,8 @@ impl Config {
             mtu: raw.mtu,
             nat_port_range: lo..=hi,
             udp_nat_timeout: raw.udp_nat_timeout_s * SECOND,
+            dns_upstream,
+            control_socket: raw.control_socket,
             allow_destinations: raw.allow_destinations,
             users,
         })
@@ -183,6 +220,18 @@ impl Config {
             .hosts()
             .find(|ip| *ip != self.gateway() && !used.contains(ip))
     }
+}
+
+/// IPv4 `nameserver` entries of a resolv.conf, as port-53 addresses.
+pub fn parse_resolv_conf(text: &str) -> Vec<SocketAddr> {
+    text.lines()
+        .filter_map(|l| {
+            let mut w = l.split_whitespace();
+            (w.next()? == "nameserver").then_some(())?;
+            let ip: Ipv4Addr = w.next()?.parse().ok()?;
+            Some(SocketAddr::from((ip, 53)))
+        })
+        .collect()
 }
 
 fn gateway_addr(subnet: Ipv4Net) -> Ipv4Addr {
@@ -212,6 +261,50 @@ mod tests {
         assert_eq!(c.mtu, 1400);
         assert_eq!(c.nat_port_range, 20000..=60000);
         assert_eq!(c.next_free_vip(), Some(Ipv4Addr::new(10, 77, 0, 2)));
+        assert!(c.dns_upstream.is_empty());
+        assert_eq!(c.control_socket, Path::new(DEFAULT_CONTROL_SOCKET));
+    }
+
+    #[test]
+    fn dns_upstreams() {
+        let c = Config::parse(&format!(
+            "private_key = \"{}\"
+ports = [1]
+dns_upstream = [\"1.1.1.1\", \"127.0.0.1:5353\"]
+",
+            key()
+        ))
+        .unwrap();
+        assert_eq!(
+            c.dns_upstream,
+            vec![
+                SocketAddr::from(([1, 1, 1, 1], 53)),
+                SocketAddr::from(([127, 0, 0, 1], 5353))
+            ]
+        );
+        let bad = format!(
+            "private_key = \"{}\"
+ports = [1]
+dns_upstream = [\"::1\"]
+",
+            key()
+        );
+        assert!(Config::parse(&bad).is_err());
+
+        let resolv = "# generated
+search example
+nameserver 192.0.2.53
+nameserver ::1
+options edns0
+nameserver 198.51.100.1 # second
+";
+        assert_eq!(
+            parse_resolv_conf(resolv),
+            vec![
+                SocketAddr::from(([192, 0, 2, 53], 53)),
+                SocketAddr::from(([198, 51, 100, 1], 53))
+            ]
+        );
     }
 
     #[test]

@@ -25,11 +25,19 @@ public_key = "<node public key>"
 # pad_max = 48
 # bulk_enter_kbps = 2000  # flows faster than this for 1s get a single copy
 # bulk_exit_kbps = 1000   # ...until they stay below this for 5s
+# rekey_interval_s = 600  # fresh keys inside the session; 0 = never
 
-# Executable names as shown in Task Manager's "Details" tab.
+[dns]
+# rules: queries for the games' `domains` (and subdomains) resolve through
+#        the node, the rest directly; all: every query; off: none.
+# mode = "rules"
+
+# Executable names as shown in Task Manager's "Details" tab. `domains`
+# only matter for [dns] mode = "rules".
 [[game]]
 name = "cs2"
 process = ["cs2.exe"]
+# domains = ["steamserver.net"]
 
 [[game]]
 name = "valorant"

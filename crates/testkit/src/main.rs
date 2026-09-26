@@ -2,7 +2,7 @@
 //! `key=value` so scripts can parse it.
 
 use std::io::{Read, Write};
-use std::net::{SocketAddr, TcpListener, TcpStream, UdpSocket};
+use std::net::{Ipv4Addr, SocketAddr, TcpListener, TcpStream, UdpSocket};
 use std::process::ExitCode;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -83,6 +83,23 @@ enum Command {
         #[arg(long, default_value_t = 10)]
         secs: u64,
     },
+    /// DNS server answering every A query with `answer`; logs each query
+    /// with its source.
+    DnsServer {
+        #[arg(long)]
+        bind: SocketAddr,
+        #[arg(long)]
+        answer: Ipv4Addr,
+    },
+    /// Resolves `name` (type A) against `server`; exits 0 on an answer.
+    DnsQuery {
+        #[arg(long)]
+        server: SocketAddr,
+        #[arg(long)]
+        name: String,
+        #[arg(long, default_value_t = 2000)]
+        timeout_ms: u64,
+    },
 }
 
 fn main() -> ExitCode {
@@ -113,6 +130,12 @@ fn main() -> ExitCode {
         } => probe(target, count, wait_ms),
         Command::TcpSource { bind } => tcp_source(bind),
         Command::TcpSink { target, secs } => tcp_sink(target, secs),
+        Command::DnsServer { bind, answer } => dns_server(bind, answer),
+        Command::DnsQuery {
+            server,
+            name,
+            timeout_ms,
+        } => dns_query(server, &name, timeout_ms),
     };
     match result {
         Ok(true) => ExitCode::SUCCESS,
@@ -343,4 +366,120 @@ fn probe(target: SocketAddr, count: u32, wait_ms: u64) -> Res {
     }
     println!("probe sent={count} responses={responses}");
     Ok(responses == 0)
+}
+
+/// End of the first question (after QTYPE/QCLASS), if well formed.
+fn question_end(msg: &[u8]) -> Option<usize> {
+    let mut pos = 12;
+    loop {
+        let len = usize::from(*msg.get(pos)?);
+        pos += 1;
+        if len == 0 {
+            break;
+        }
+        if len > 63 {
+            return None;
+        }
+        pos += len;
+    }
+    (pos + 4 <= msg.len()).then_some(pos + 4)
+}
+
+fn question_name(msg: &[u8]) -> String {
+    let mut labels = vec![];
+    let mut pos = 12;
+    while let Some(&len) = msg.get(pos) {
+        if len == 0 || len > 63 {
+            break;
+        }
+        let l = msg.get(pos + 1..pos + 1 + usize::from(len)).unwrap_or(&[]);
+        labels.push(String::from_utf8_lossy(l).into_owned());
+        pos += 1 + usize::from(len);
+    }
+    labels.join(".")
+}
+
+fn dns_server(bind: SocketAddr, answer: Ipv4Addr) -> Res {
+    let sock = UdpSocket::bind(bind)?;
+    eprintln!("dns server on {bind}, answering {answer}");
+    let mut buf = [0u8; 1500];
+    loop {
+        let (n, from) = sock.recv_from(&mut buf)?;
+        let q = &buf[..n];
+        let Some(end) = question_end(q).filter(|_| n >= 12 && q[2] & 0x80 == 0) else {
+            continue;
+        };
+        println!("dns-server query from={from} name={}", question_name(q));
+        let mut r = q[..end].to_vec();
+        r[2] = 0x81; // QR, RD
+        r[3] = 0x80; // RA
+        r[4..12].copy_from_slice(&[0, 1, 0, 1, 0, 0, 0, 0]);
+        r.extend_from_slice(&[0xc0, 12, 0, 1, 0, 1, 0, 0, 0, 60, 0, 4]);
+        r.extend_from_slice(&answer.octets());
+        sock.send_to(&r, from)?;
+    }
+}
+
+fn dns_query(server: SocketAddr, name: &str, timeout_ms: u64) -> Res {
+    let sock = UdpSocket::bind(("0.0.0.0", 0))?;
+    sock.connect(server)?;
+    let id: u16 = rand::rng().random();
+    let mut q = vec![0u8; 12];
+    q[..2].copy_from_slice(&id.to_be_bytes());
+    q[2] = 0x01;
+    q[5] = 1;
+    for l in name.split('.').filter(|l| !l.is_empty()) {
+        q.push(l.len() as u8);
+        q.extend_from_slice(l.as_bytes());
+    }
+    q.extend_from_slice(&[0, 0, 1, 0, 1]);
+    let start = Instant::now();
+    sock.send(&q)?;
+    sock.set_read_timeout(Some(Duration::from_millis(100)))?;
+    let mut buf = [0u8; 1500];
+    while start.elapsed() < Duration::from_millis(timeout_ms) {
+        let Ok(n) = sock.recv(&mut buf) else { continue };
+        let r = &buf[..n];
+        if n < 12 || r[..2] != id.to_be_bytes() || r[2] & 0x80 == 0 {
+            continue;
+        }
+        let rtt = start.elapsed();
+        // First A record after the question.
+        let Some(mut pos) = question_end(r) else {
+            continue;
+        };
+        let ancount = u16::from_be_bytes([r[6], r[7]]);
+        for _ in 0..ancount {
+            // Name: a pointer or labels.
+            while pos < n && r[pos] != 0 && r[pos] & 0xc0 != 0xc0 {
+                pos += 1 + usize::from(r[pos]);
+            }
+            pos += if r.get(pos).is_some_and(|b| b & 0xc0 == 0xc0) {
+                2
+            } else {
+                1
+            };
+            let Some(h) = r.get(pos..pos + 10) else { break };
+            let (ty, len) = (
+                u16::from_be_bytes([h[0], h[1]]),
+                usize::from(u16::from_be_bytes([h[8], h[9]])),
+            );
+            pos += 10;
+            if ty == 1 && len == 4 {
+                if let Some(a) = r.get(pos..pos + 4) {
+                    println!(
+                        "dns answer={} rtt_us={}",
+                        Ipv4Addr::new(a[0], a[1], a[2], a[3]),
+                        rtt.as_micros()
+                    );
+                    return Ok(true);
+                }
+            }
+            pos += len;
+        }
+        println!("dns answer=none rtt_us={}", rtt.as_micros());
+        return Ok(false);
+    }
+    println!("dns timeout");
+    Ok(false)
 }

@@ -1,5 +1,6 @@
 //! Linux TUN backend, used by the netns testbed: destinations in `routes`
-//! go through the TUN device, whose address is the VIP.
+//! go through the TUN device, whose address is the VIP, and so does the
+//! node's DNS resolver address.
 
 use std::net::Ipv4Addr;
 use std::sync::Arc;
@@ -17,16 +18,23 @@ pub struct TunCapture {
 }
 
 impl TunCapture {
-    pub fn open(name: &str, vip: Ipv4Addr, mtu: u16, routes: &[Ipv4Net]) -> Result<Self> {
+    pub fn open(
+        name: &str,
+        vip: Ipv4Addr,
+        mtu: u16,
+        routes: &[Ipv4Net],
+        resolver: Ipv4Addr,
+    ) -> Result<Self> {
         let tun = Tun::open(name, false).context("creating TUN device (are you root?)")?;
         tun.configure(vip, 32, mtu)?;
-        for r in routes {
+        let resolver = Ipv4Net::from(resolver);
+        for r in routes.iter().chain([&resolver]) {
             cmd::run(
                 "ip",
                 &["route", "replace", &r.to_string(), "dev", tun.name()],
             )?;
         }
-        info!(dev = tun.name(), %vip, ?routes, "TUN capture ready");
+        info!(dev = tun.name(), %vip, ?routes, %resolver, "TUN capture ready");
         Ok(Self { tun })
     }
 }

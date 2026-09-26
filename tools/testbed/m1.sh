@@ -17,7 +17,7 @@ PIDS=()
 FAILED=0
 
 cleanup() {
-    for p in "${PIDS[@]}"; do kill "$p" 2>/dev/null; done
+    for p in "${PIDS[@]}"; do pkill -P "$p" 2>/dev/null; kill "$p" 2>/dev/null; done
     wait 2>/dev/null
     bash "$NS" down
     rm -rf "$WORK"

@@ -26,12 +26,33 @@ pub const PATH_DOWN_IDLE: Micros = PATH_DOWN + PING_IDLE * (100 + PING_JITTER_PC
 /// The server forgets a path down for this long.
 pub const PATH_FORGET: Micros = 60 * SECOND;
 
-/// Client re-handshakes after this long without any valid packet.
+/// The client moves a path to a new socket (new local port, so a new NAT
+/// mapping) once it has been down this long, and at most this often.
+pub const PATH_REBIND: Micros = 10 * SECOND;
+
+/// While data flows, the client handshakes again after this long without
+/// any valid packet, keeping the session until the node answers: a
+/// restarted node has forgotten the session and stays silent.
+pub const CLIENT_RESUME: Micros = 3 * SECOND;
+/// Client re-handshakes after this long without any valid packet; while
+/// idle (PINGs 10s ± 20% apart) the limit covers one lost PONG more.
 pub const CLIENT_SESSION_DEAD: Micros = 15 * SECOND;
+pub const CLIENT_SESSION_DEAD_IDLE: Micros =
+    CLIENT_SESSION_DEAD + PING_IDLE * (100 + PING_JITTER_PCT) / 100;
 /// Server drops a session after this long without any valid packet.
 pub const SERVER_SESSION_EXPIRE: Micros = 180 * SECOND;
 
 pub const UDP_NAT_TIMEOUT: Micros = 300 * SECOND;
+
+/// In-channel rekey (SPEC §3.9): default interval, how long the client
+/// waits for `REKEY_RESP` before trying again, and how long a replaced
+/// receive keyset still opens late packets.
+pub const REKEY_INTERVAL: Micros = 600 * SECOND;
+pub const REKEY_RETRY: Micros = 3 * SECOND;
+pub const KEY_RETAIN: Micros = 30 * SECOND;
+
+/// Forwarded DNS queries are forgotten after this long (SPEC §7.5).
+pub const DNS_TIMEOUT: Micros = 5 * SECOND;
 
 /// STATS interval while active / idle.
 pub const STATS_ACTIVE: Micros = SECOND;

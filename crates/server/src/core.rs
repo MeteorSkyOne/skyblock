@@ -1,22 +1,24 @@
 //! Transport-independent server logic (SPEC §3.6–3.9, §4, §7.2): handshakes,
-//! sessions, paths, redundant sending and frame handling. The event loop
-//! feeds datagrams in and performs the I/O requested through [`ServerIo`].
+//! in-channel rekeys, sessions, paths, redundant sending and frame
+//! handling. The event loop feeds datagrams in and performs the I/O
+//! requested through [`ServerIo`].
 
 use std::collections::HashMap;
+use std::fmt::Write as _;
 use std::net::{Ipv4Addr, SocketAddr};
 
 use rand::SeedableRng;
 use rand::rngs::StdRng;
 use skyblock_proto::Micros;
 use skyblock_proto::flow::{Class, FlowClassifier, FlowKey};
-use skyblock_proto::frame::{Frame, FrameReader, PathStats, Pong, Stats};
+use skyblock_proto::frame::{Frame, FrameReader, PathStats, Pong, ProbeReq, ProbeResp, Stats};
 use skyblock_proto::handshake::{MAX_MSG_LEN, PendingResponse, ServerHello};
 use skyblock_proto::ip::Ipv4Packet;
-use skyblock_proto::keys::{PrivateKey, Psk, PublicKey, SessionKeys};
+use skyblock_proto::keys::{Keyset, PrivateKey, Psk, PublicKey, SessionKeys};
 use skyblock_proto::packet::{MIN_LEN, PacketBuf};
 use skyblock_proto::path::{PathMetrics, Ranking, down_after};
 use skyblock_proto::sched::{Plan, Policy, SchedStats, Scheduler};
-use skyblock_proto::session::{Data, RxState, TxState, open_handshake, seal_handshake};
+use skyblock_proto::session::{Data, KeyPhase, RxState, TxState, open_handshake, seal_handshake};
 use skyblock_proto::timing::{
     ACTIVE_WINDOW, PATH_FORGET, SECOND, SERVER_SESSION_EXPIRE, STATS_ACTIVE, STATS_IDLE,
 };
@@ -28,11 +30,17 @@ use crate::limit::RateLimiter;
 /// A session whose client never proved key possession is dropped sooner.
 const UNCONFIRMED_EXPIRE: Micros = 30 * SECOND;
 
+/// Most pings one PROBE_REQ may ask for.
+pub const MAX_PROBE_COUNT: u8 = 20;
+
 pub trait ServerIo {
     /// Sends a tunnel packet from local socket `sock` to `to`.
     fn send(&mut self, sock: usize, to: SocketAddr, pkt: &[u8]);
     /// Hands over an inner packet from `user` that passed the filter.
     fn deliver(&mut self, user: usize, ip: &[u8]);
+    /// Starts a latency probe for `user` (already validated); the result
+    /// goes back through [`Core::send_control`].
+    fn probe(&mut self, _user: usize, _req: ProbeReq) {}
 }
 
 pub struct User {
@@ -75,6 +83,9 @@ pub struct CoreStats {
     /// Inner packets sent to clients, and those sent as bulk (one copy).
     pub sent: u64,
     pub sent_bulk: u64,
+    /// In-channel rekeys completed (the client switched to the new keys).
+    pub rekeys: u64,
+    pub probes: u64,
 }
 
 struct Path {
@@ -99,6 +110,11 @@ struct Session {
     /// Last inner data either way; 0 = never.
     last_active: Micros,
     next_stats: Micros,
+    established: Micros,
+    /// Sending keys from an answered REKEY_INIT, used once the client
+    /// sends under its new keys.
+    next_tx: Option<Keyset>,
+    rekeys: u64,
 }
 
 impl Session {
@@ -169,6 +185,14 @@ impl Core {
 
     pub fn user_by_vip(&self, ip: Ipv4Addr) -> Option<usize> {
         self.by_vip.get(&ip).copied()
+    }
+
+    pub fn filter(&self) -> &InnerFilter {
+        &self.filter
+    }
+
+    pub fn user_count(&self) -> usize {
+        self.users.len()
     }
 
     pub fn session_count(&self) -> usize {
@@ -287,6 +311,24 @@ impl Core {
         }
     }
 
+    /// Sends one control frame (e.g. PROBE_RESP) to `user`'s client on its
+    /// best path. Returns whether it was sent.
+    pub fn send_control(&mut self, user: usize, frame: &Frame<'_>, io: &mut impl ServerIo) -> bool {
+        let Some(Some(s)) = self.sessions.get_mut(user) else {
+            return false;
+        };
+        let Some(i) = s.ranking.best().filter(|_| s.confirmed) else {
+            return false;
+        };
+        let Ok(out) = s.tx.control(|w| w.write(frame)) else {
+            return false;
+        };
+        let p = &mut s.paths[i];
+        p.m.tx_pkts += 1;
+        io.send(p.sock, p.addr, out);
+        true
+    }
+
     /// When the earliest delayed copy is due.
     pub fn next_due(&self) -> Option<Micros> {
         self.sessions
@@ -326,6 +368,83 @@ impl Core {
         }
         self.hs_limit.cleanup(now);
         self.trial_limit.cleanup(now);
+    }
+
+    /// Per-user session state for `skyblock-server status`. `ports[i]` is
+    /// the port of local socket `i`; `extra(user)` is appended to the
+    /// user's first line (e.g. NAT mapping count).
+    pub fn report(
+        &self,
+        now: Micros,
+        ports: &[u16],
+        extra: impl Fn(usize) -> String,
+        out: &mut String,
+    ) {
+        let ms = |us: Micros| us as f64 / 1000.0;
+        let pct = |v: f32| v * 100.0;
+        for (u, user) in self.users.iter().enumerate() {
+            let Some(s) = &self.sessions[u] else {
+                let _ = writeln!(
+                    out,
+                    "user {} ({}): no session{}",
+                    user.name,
+                    user.vip,
+                    extra(u)
+                );
+                continue;
+            };
+            let up = s.active(now);
+            let _ = writeln!(
+                out,
+                "user {} ({}): session {} {}, last packet {:.1}s ago, {}, copies {} paths {} delay {:.1}ms, rekeys {}, flows {} (bulk {}){}",
+                user.name,
+                user.vip,
+                duration(now.saturating_sub(s.established)),
+                if s.confirmed {
+                    "confirmed"
+                } else {
+                    "unconfirmed"
+                },
+                now.saturating_sub(s.last_rx) as f64 / SECOND as f64,
+                if up { "active" } else { "idle" },
+                s.policy.copies,
+                s.policy.paths,
+                ms(s.policy.copy_delay),
+                s.rekeys,
+                s.flows.len(),
+                s.flows.bulk_count(),
+                extra(u),
+            );
+            let down = down_after(up);
+            for (i, p) in s.paths.iter().enumerate() {
+                let id = p.id.map_or_else(|| "?".to_owned(), |id| id.to_string());
+                let port = ports.get(p.sock).copied().unwrap_or(0);
+                let rank = s.ranking.order().iter().position(|&r| usize::from(r) == i);
+                let _ = writeln!(
+                    out,
+                    "  path {id:>2}  {} -> :{port}  {}{}  rtt {:.1}ms ±{:.1}  loss out {:.2}% in {:.2}%  tx {} rx {}",
+                    p.addr,
+                    if p.m.is_up(now, down) { "up  " } else { "down" },
+                    if rank == Some(0) { " best" } else { "     " },
+                    ms(p.m.rtt.srtt),
+                    ms(p.m.rtt.rttvar),
+                    pct(p.m.loss_out()),
+                    pct(p.m.loss_in()),
+                    p.m.tx_pkts,
+                    p.m.rx_pkts,
+                );
+            }
+            let r = s.rx.stats;
+            let _ = writeln!(
+                out,
+                "  received {} unique, {} duplicate, {} rescued; sent {} items, {} extra copies",
+                r.unique,
+                r.dup,
+                r.rescued,
+                s.tx.items_sent(),
+                s.sched.stats.copies_sent,
+            );
+        }
     }
 
     fn on_handshake(
@@ -400,6 +519,9 @@ impl Core {
             last_rx: now,
             last_active: 0,
             next_stats: now + STATS_IDLE,
+            established: now,
+            next_tx: None,
+            rekeys: 0,
         };
         s.rerank(now);
         self.sessions[u] = Some(s);
@@ -428,19 +550,31 @@ impl Core {
         io: &mut impl ServerIo,
     ) -> bool {
         let Core {
+            local,
+            params,
             sessions,
             by_addr,
             filter,
             users,
+            hs_limit,
             stats,
             ..
         } = self;
         let Some(s) = sessions[u].as_mut() else {
             return false;
         };
-        let Ok(body) = s.rx.open(pkt) else {
+        let Ok((body, phase)) = s.rx.open(now, pkt) else {
             return false;
         };
+        if phase == KeyPhase::Next {
+            // The client uses the keys from its last rekey: follow suit.
+            if let Some(k) = s.next_tx.take() {
+                s.tx.rekey(k);
+            }
+            s.rekeys += 1;
+            stats.rekeys += 1;
+            debug!(user = %users[u].name, "rekeyed");
+        }
         s.last_rx = now;
         s.confirmed = true;
         let mut path = match s
@@ -503,6 +637,47 @@ impl Core {
                         }
                     }
                     s.rerank(now);
+                }
+                Frame::RekeyInit(msg) => {
+                    if !hs_limit.allow(now, from.ip()) {
+                        stats.rate_limited += 1;
+                        continue;
+                    }
+                    let user = &mut users[u];
+                    let (msg2, n) = match answer_rekey(local, params, user, s, msg) {
+                        Ok(r) => r,
+                        Err(e) => {
+                            debug!(user = %user.name, "rekey rejected: {e}");
+                            stats.rejected_handshakes += 1;
+                            continue;
+                        }
+                    };
+                    if let Ok(out) = s.tx.control(|w| w.write(&Frame::RekeyResp(&msg2[..n]))) {
+                        let p = &mut s.paths[path];
+                        p.m.tx_pkts += 1;
+                        io.send(p.sock, p.addr, out);
+                    }
+                }
+                Frame::ProbeReq(req) => {
+                    stats.probes += 1;
+                    if probe_allowed(filter, &req) {
+                        io.probe(u, req);
+                    } else {
+                        debug!(user = %users[u].name, target = %req.ip, "probe refused");
+                        let resp = Frame::ProbeResp(ProbeResp {
+                            id: req.id,
+                            sent: 0,
+                            recv: 0,
+                            min_us: 0,
+                            avg_us: 0,
+                            max_us: 0,
+                        });
+                        if let Ok(out) = s.tx.control(|w| w.write(&resp)) {
+                            let p = &mut s.paths[path];
+                            p.m.tx_pkts += 1;
+                            io.send(p.sock, p.addr, out);
+                        }
+                    }
                 }
                 Frame::Close(_) => close = true,
                 _ => match s.rx.accept(now, &frame) {
@@ -571,6 +746,58 @@ impl Core {
             }
         }
     }
+}
+
+/// `1h02m`, `3m05s`, `42s`.
+pub fn duration(us: Micros) -> String {
+    let s = us / SECOND;
+    match s {
+        0..60 => format!("{s}s"),
+        60..3600 => format!("{}m{:02}s", s / 60, s % 60),
+        _ => format!("{}h{:02}m", s / 3600, s % 3600 / 60),
+    }
+}
+
+/// Handles REKEY_INIT (SPEC §3.9): a fresh IKpsk2 message 1 from the same
+/// client key. Returns message 2, which the caller sends in REKEY_RESP
+/// under the current keys, and stages the new keys: receiving ones as
+/// `next`, sending ones until the client uses its new keys.
+fn answer_rekey(
+    local: &PrivateKey,
+    params: &CoreParams,
+    user: &mut User,
+    s: &mut Session,
+    msg: &[u8],
+) -> Result<([u8; MAX_MSG_LEN], usize), String> {
+    let pending = PendingResponse::read(local, msg).map_err(|e| e.to_string())?;
+    if pending.client != user.key {
+        return Err("different client key".into());
+    }
+    if pending.hello.timestamp <= user.last_ts {
+        return Err("stale or replayed".into());
+    }
+    user.last_ts = pending.hello.timestamp;
+    let hello = ServerHello {
+        vip: user.vip,
+        resolver: params.resolver,
+        mtu: params.mtu,
+        flags: 0,
+    };
+    let mut msg2 = [0u8; MAX_MSG_LEN];
+    let (n, keys) = pending
+        .accept(&user.psk, &hello, &mut msg2)
+        .map_err(|e| e.to_string())?;
+    s.rx.set_next(keys.c2s);
+    s.next_tx = Some(keys.s2c);
+    Ok((msg2, n))
+}
+
+/// Whether a PROBE_REQ may run: a reasonable count and interval, and a
+/// target clients could reach anyway.
+fn probe_allowed(filter: &InnerFilter, req: &ProbeReq) -> bool {
+    (1..=MAX_PROBE_COUNT).contains(&req.count)
+        && (10..=1000).contains(&req.interval_ms)
+        && filter.destination_allowed(req.ip)
 }
 
 /// Records that path slot `idx` is the client's path `id`. If another slot
@@ -657,6 +884,7 @@ mod tests {
     struct Io {
         sent: Vec<(usize, SocketAddr, Vec<u8>)>,
         delivered: Vec<(usize, Vec<u8>)>,
+        probes: Vec<(usize, ProbeReq)>,
     }
 
     impl ServerIo for Io {
@@ -665,6 +893,9 @@ mod tests {
         }
         fn deliver(&mut self, user: usize, ip: &[u8]) {
             self.delivered.push((user, ip.to_vec()));
+        }
+        fn probe(&mut self, user: usize, req: ProbeReq) {
+            self.probes.push((user, req));
         }
     }
 
@@ -806,7 +1037,7 @@ mod tests {
         /// Opens a server->client packet and returns its frames' debug text.
         fn client_open(&mut self, pkt: &[u8]) -> Vec<String> {
             let mut p = pkt.to_vec();
-            let body = self.client.rx.as_mut().unwrap().open(&mut p).unwrap();
+            let (body, _) = self.client.rx.as_mut().unwrap().open(0, &mut p).unwrap();
             FrameReader::new(body)
                 .map(|f| format!("{:?}", f.unwrap()))
                 .collect()
@@ -1098,5 +1329,161 @@ mod tests {
             f[0].starts_with("Stats") && f[0].contains("tx_unique: 1"),
             "{f:?}"
         );
+    }
+
+    /// REKEY_INIT carrying a fresh message 1 stamped `ts`, and the
+    /// initiator that finishes it with the node's REKEY_RESP.
+    fn rekey_init_at(h: &mut Harness, key: &PrivateKey, ts: u64) -> (Vec<u8>, Initiator) {
+        let hello = ClientHello {
+            timestamp: ts,
+            n_paths: 1,
+            flags: 0,
+        };
+        let mut m1 = [0u8; MAX_MSG_LEN];
+        let (init, n) = Initiator::start(key, &h.node, &Psk::ZERO, &hello, &mut m1).unwrap();
+        let pkt = h.client_control(&[Frame::RekeyInit(&m1[..n])]);
+        (pkt, init)
+    }
+
+    fn rekey_init(h: &mut Harness) -> (Vec<u8>, Initiator) {
+        let ts = next_timestamp(h.client.last_ts);
+        h.client.last_ts = ts;
+        let key = h.client.key.clone();
+        rekey_init_at(h, &key, ts)
+    }
+
+    #[test]
+    fn in_channel_rekey() {
+        let mut h = Harness::new();
+        h.connect(1, 1, 0);
+        let old_up = h.client_ip(&udp(VIP, GAME));
+
+        let (init_pkt, init) = rekey_init(&mut h);
+        h.feed(10, addr(1000), &init_pkt);
+        let (_, _, resp) = h.io.sent.pop().expect("REKEY_RESP");
+        // Sealed under the old keys.
+        let mut p = resp.clone();
+        let (body, _) = h.client.rx.as_mut().unwrap().open(0, &mut p).unwrap();
+        let Some(Ok(Frame::RekeyResp(msg))) = FrameReader::new(body).next() else {
+            panic!("expected REKEY_RESP")
+        };
+        let (_, keys) = init.finish(msg).unwrap();
+
+        // Until the client uses the new keys, the node keeps sending under
+        // the old ones.
+        assert!(h.core.send_ip(11, 0, &udp(GAME, VIP), &mut h.io));
+        let (_, _, down) = h.io.sent.pop().unwrap();
+        assert!(h.client_open(&down)[0].starts_with("Ip"));
+
+        h.client.tx.as_mut().unwrap().rekey(keys.c2s);
+        h.client.rx.as_mut().unwrap().set_next(keys.s2c);
+        let new_up = h.client_ip(&udp(VIP, GAME));
+        h.feed(12, addr(1000), &new_up);
+        assert_eq!(h.io.delivered.len(), 1);
+        assert_eq!(h.core.stats.rekeys, 1);
+        // Now the node sends under the new keys...
+        assert!(h.core.send_ip(13, 0, &udp(GAME, VIP), &mut h.io));
+        let (_, _, down) = h.io.sent.pop().unwrap();
+        let mut p = down.clone();
+        let (_, phase) = h.client.rx.as_mut().unwrap().open(13, &mut p).unwrap();
+        assert_eq!(phase, KeyPhase::Next);
+        // ...and a late packet under the old ones still gets through.
+        h.feed(14, addr(1000), &old_up);
+        assert_eq!(h.io.delivered.len(), 2);
+    }
+
+    #[test]
+    fn stale_or_foreign_rekey_is_refused() {
+        let mut h = Harness::new();
+        h.connect(1, 1, 0);
+        let (pkt, _) = rekey_init(&mut h);
+        h.feed(10, addr(1000), &pkt);
+        assert_eq!(h.io.sent.len(), 1);
+
+        // A message 1 no newer than the last one seen.
+        let (key, ts) = (h.client.key.clone(), h.client.last_ts);
+        let (stale, _) = rekey_init_at(&mut h, &key, ts);
+        h.feed(11, addr(1000), &stale);
+        assert_eq!(h.io.sent.len(), 1, "stale timestamp: no answer");
+
+        // Another user's key cannot rekey this session.
+        let (foreign, _) = rekey_init_at(&mut h, &PrivateKey::generate(), ts + 1);
+        h.feed(12, addr(1000), &foreign);
+        assert_eq!(h.io.sent.len(), 1);
+        assert_eq!(h.core.stats.rejected_handshakes, 2);
+    }
+
+    fn probe_req(ip: Ipv4Addr, count: u8) -> ProbeReq {
+        ProbeReq {
+            id: 5,
+            kind: skyblock_proto::frame::ProbeKind::Icmp,
+            ip,
+            port: 0,
+            count,
+            interval_ms: 100,
+        }
+    }
+
+    #[test]
+    fn probes_are_validated_and_answered() {
+        let mut h = Harness::new();
+        h.connect(1, 1, 0);
+        let pkt = h.client_control(&[Frame::ProbeReq(probe_req(GAME, 10))]);
+        h.feed(10, addr(1000), &pkt);
+        assert_eq!(h.io.probes, vec![(0, probe_req(GAME, 10))]);
+        assert!(h.io.sent.is_empty());
+
+        for bad in [
+            probe_req(Ipv4Addr::new(169, 254, 169, 254), 10),
+            probe_req(GAME, 0),
+            probe_req(GAME, MAX_PROBE_COUNT + 1),
+        ] {
+            let pkt = h.client_control(&[Frame::ProbeReq(bad)]);
+            h.feed(11, addr(1000), &pkt);
+        }
+        assert_eq!(h.io.probes.len(), 1);
+        let sent = h.io.sent.clone();
+        assert_eq!(sent.len(), 3);
+        for (_, _, p) in sent {
+            let f = h.client_open(&p);
+            assert!(
+                f[0].starts_with("ProbeResp") && f[0].contains("sent: 0"),
+                "{f:?}"
+            );
+        }
+
+        h.io.sent.clear();
+        let resp = Frame::ProbeResp(ProbeResp {
+            id: 5,
+            sent: 10,
+            recv: 9,
+            min_us: 1,
+            avg_us: 2,
+            max_us: 3,
+        });
+        assert!(h.core.send_control(0, &resp, &mut h.io));
+        let (_, to, p) = h.io.sent.pop().unwrap();
+        assert_eq!(to, addr(1000));
+        assert!(h.client_open(&p)[0].contains("recv: 9"));
+        assert!(!h.core.send_control(1, &resp, &mut h.io), "no such user");
+    }
+
+    #[test]
+    fn status_report() {
+        let mut h = Harness::new();
+        h.connect(2, 2, 2000);
+        let mut out = String::new();
+        h.core
+            .report(3 * SECOND, &[40001], |u| format!(", nat {u}"), &mut out);
+        assert!(
+            out.starts_with("user me (10.77.0.2): session 3s confirmed"),
+            "{out}"
+        );
+        assert!(out.contains("copies 2 paths 0 delay 2.0ms"), "{out}");
+        assert!(out.contains(", nat 0"), "{out}");
+        assert_eq!(out.matches("  path ").count(), 2, "{out}");
+        assert!(out.contains("198.51.100.7:1000 -> :40001"), "{out}");
+        assert_eq!(duration(3725 * SECOND), "1h02m");
+        assert_eq!(duration(185 * SECOND), "3m05s");
     }
 }

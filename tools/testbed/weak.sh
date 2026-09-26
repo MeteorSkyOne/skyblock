@@ -20,7 +20,7 @@ BLACKOUT=()
 FAILED=0
 
 cleanup() {
-    for p in "${BLACKOUT[@]}" "${PIDS[@]}"; do kill "$p" 2>/dev/null; done
+    for p in "${BLACKOUT[@]}" "${PIDS[@]}"; do pkill -P "$p" 2>/dev/null; kill "$p" 2>/dev/null; done
     wait 2>/dev/null
     bash "$NS" down
     rm -rf "$WORK"
@@ -55,13 +55,22 @@ bench_loss() {
     sed -n "s/^copies $2 paths $3 delay $4ms: sent [0-9]* lost [0-9]* (\([0-9.]*\)%).*/\1/p" <<<"$1"
 }
 
+# At 30% loss each way a handshake round trip gets through half the time,
+# so the retries in bench's first 10s all fail now and then (~7%): one
+# more try before calling it a failure.
 bench() {
-    if ! in_ns client "$BIN/skyblock" bench -c "$WORK/bench.toml" --duration "${SECS}s" "$@" \
-        2>"$WORK/bench.log"; then
-        echo "bench failed:" >&2
-        grep -v INFO "$WORK/bench.log" | tail -5 >&2
-        FAILED=1
-    fi
+    local try
+    for try in 1 2; do
+        if in_ns client "$BIN/skyblock" bench -c "$WORK/bench.toml" --duration "${SECS}s" "$@" \
+            2>"$WORK/bench.log"; then
+            return
+        fi
+        grep -q "no session with" "$WORK/bench.log" && [ "$try" = 1 ] && continue
+        break
+    done
+    echo "bench failed:" >&2
+    grep -v INFO "$WORK/bench.log" | tail -5 >&2
+    FAILED=1
 }
 
 show() {
@@ -115,7 +124,7 @@ blackouts() {
 }
 
 stop_blackouts() {
-    for p in "${BLACKOUT[@]}"; do kill "$p" 2>/dev/null; done
+    for p in "${BLACKOUT[@]}"; do pkill -P "$p" 2>/dev/null; kill "$p" 2>/dev/null; done
     BLACKOUT=()
     sleep 0.2
     bash "$NS" netem baseline
@@ -245,7 +254,11 @@ if want W7; then
 fi
 
 sleep 1
-check "up session survived every case" bash -c "! grep -q reconnecting $WORK/client.log"
+check "up session survived every case" \
+    bash -c "! grep -qE 'reconnecting|handshaking again' $WORK/client.log"
+echo "--- client log (handshakes, socket moves, warnings)"
+sed 's/\x1b\[[0-9;]*m//g' "$WORK/client.log" |
+    grep -E "connected|handshak|moved|silent|WARN|ERROR" | tail -12
 echo "--- up status (last line)"
 tail -1 "$WORK/client.out"
 exit $FAILED

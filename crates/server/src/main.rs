@@ -4,11 +4,14 @@
 
 mod config;
 mod core;
+mod dns;
 #[cfg(target_os = "linux")]
 mod event_loop;
 mod filter;
 mod limit;
 mod nat;
+#[cfg(target_os = "linux")]
+mod probe;
 mod setup;
 
 use std::path::PathBuf;
@@ -50,6 +53,14 @@ enum Command {
         #[arg(short, long, default_value = DEFAULT_CONFIG)]
         config: PathBuf,
     },
+    /// Show sessions, paths, NAT mappings and counters of the running node.
+    Status {
+        #[arg(short, long, default_value = DEFAULT_CONFIG)]
+        config: PathBuf,
+        /// Control socket (default: `control_socket` from the config).
+        #[arg(long)]
+        socket: Option<PathBuf>,
+    },
     /// Authorize a client key, assign it a VIP and print its [[node]] block.
     Adduser {
         name: String,
@@ -64,13 +75,19 @@ enum Command {
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
-    tracing_subscriber::fmt()
+    let log = tracing_subscriber::fmt()
         .with_max_level(cli.log_level)
-        .with_target(false)
-        .init();
+        .with_target(false);
+    // Under systemd the journal stamps every line itself.
+    if std::env::var_os("JOURNAL_STREAM").is_some() {
+        log.without_time().with_ansi(false).init();
+    } else {
+        log.init();
+    }
     match cli.command {
         Command::Init { dir, ports, egress } => setup::init(&dir, &ports, egress),
         Command::Run { config } => run(config),
+        Command::Status { config, socket } => status(config, socket),
         Command::Adduser {
             name,
             public_key,
@@ -87,5 +104,33 @@ fn run(config: PathBuf) -> Result<()> {
 
 #[cfg(not(target_os = "linux"))]
 fn run(_config: PathBuf) -> Result<()> {
+    anyhow::bail!("skyblock-server runs on Linux only")
+}
+
+/// Prints the report the running node writes to its control socket.
+#[cfg(unix)]
+fn status(config: PathBuf, socket: Option<PathBuf>) -> Result<()> {
+    use anyhow::Context;
+    use std::io::Read;
+
+    let path = match socket {
+        Some(p) => p,
+        None => config::Config::load(&config)?.control_socket,
+    };
+    let mut s = std::os::unix::net::UnixStream::connect(&path).with_context(|| {
+        format!(
+            "connecting to {} (is skyblock-server running?)",
+            path.display()
+        )
+    })?;
+    s.set_read_timeout(Some(std::time::Duration::from_secs(5)))?;
+    let mut report = String::new();
+    s.read_to_string(&mut report)?;
+    print!("{report}");
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn status(_config: PathBuf, _socket: Option<PathBuf>) -> Result<()> {
     anyhow::bail!("skyblock-server runs on Linux only")
 }

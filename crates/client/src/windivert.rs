@@ -29,6 +29,7 @@ const ERROR_ACCESS_DENIED: u32 = 5;
 const ERROR_INVALID_PARAMETER: u32 = 87;
 const ERROR_INVALID_IMAGE_HASH: u32 = 577;
 const ERROR_DRIVER_BLOCKED: u32 = 1275;
+const ERROR_NO_SYSTEM_RESOURCES: u32 = 1450;
 
 /// `WINDIVERT_ADDRESS` (80 bytes).
 #[repr(C)]
@@ -44,6 +45,7 @@ pub struct Address {
 
 const _: () = assert!(std::mem::size_of::<Address>() == 80);
 
+const BIT_IPV6: u32 = 1 << 20;
 const BIT_IP_CHECKSUM: u32 = 1 << 21;
 const BIT_TCP_CHECKSUM: u32 = 1 << 22;
 const BIT_UDP_CHECKSUM: u32 = 1 << 23;
@@ -77,6 +79,13 @@ impl Address {
         };
         a.data[0..4].copy_from_slice(&if_idx.to_ne_bytes());
         a.data[4..8].copy_from_slice(&sub_if_idx.to_ne_bytes());
+        a
+    }
+
+    /// Like [`inbound`](Self::inbound), for an IPv6 packet.
+    pub fn inbound_ipv6(if_idx: u32, sub_if_idx: u32) -> Self {
+        let mut a = Self::inbound(if_idx, sub_if_idx);
+        a.bits |= BIT_IPV6;
         a
     }
 
@@ -291,6 +300,14 @@ fn open_error(code: u32, api: &Api, filter: &str, layer: u32) -> io::Error {
              or anti-cheat); try `mode = \"tun\"` once Wintun mode lands"
                 .into()
         }
+        // What the driver's start reports when security software (e.g. Huorong's
+        // BYOVD rule) refuses to load it.
+        ERROR_NO_SYSTEM_RESOURCES => {
+            "WinDivertOpen: the WinDivert driver failed to start (error 1450); security \
+             software blocks it this way: add WinDivert64.sys as a driver exception \
+             (Huorong: 系统防护 → 漏洞驱动拦截 → 例外驱动; its 信任区 does not apply)"
+                .into()
+        }
         ERROR_INVALID_PARAMETER => match compile(api, filter, layer) {
             Err(e) => format!("WinDivertOpen: invalid filter ({e})"),
             Ok(()) => format!("WinDivertOpen: invalid parameter (layer {layer})"),
@@ -317,14 +334,52 @@ mod tests {
         }
         let api = load_from(&dir).expect("load WinDivert.dll");
         let nodes = [std::net::Ipv4Addr::new(203, 0, 113, 1)];
-        compile(
-            &api,
-            &crate::capture::windivert::filter(&nodes),
-            LAYER_NETWORK,
-        )
-        .unwrap();
+        for dns in [false, true] {
+            compile(
+                &api,
+                &crate::capture::windivert::filter(&nodes, dns),
+                LAYER_NETWORK,
+            )
+            .unwrap();
+        }
         compile(&api, crate::capture::windivert::SOCKET_FILTER, LAYER_SOCKET).unwrap();
         let bad = compile(&api, "outbound and !(tcp and udp)", LAYER_NETWORK).unwrap_err();
         assert!(bad.contains("position"), "{bad}");
+    }
+
+    /// Opens sniff-only handles (nothing is diverted) with our filters.
+    /// Compiling is not enough: the driver may still refuse them. If the
+    /// trivial control fails too, the driver itself does not start.
+    /// `cargo test -p skyblock open_our_filters -- --ignored --nocapture`
+    /// (as administrator, with the DLL unpacked as above).
+    #[test]
+    #[ignore]
+    fn open_our_filters() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../target/windivert/WinDivert-2.2.2-A/x64");
+        let _ = API.set(load_from(&dir));
+        let nodes = [std::net::Ipv4Addr::new(203, 0, 113, 1)];
+        let mut failed = vec![];
+        for (name, f) in [
+            (
+                "trivial control",
+                "outbound and udp.DstPort == 9".to_owned(),
+            ),
+            ("capture", crate::capture::windivert::filter(&nodes, false)),
+            (
+                "capture+dns",
+                crate::capture::windivert::filter(&nodes, true),
+            ),
+        ] {
+            let r = Handle::open(&f, LAYER_NETWORK, 0, FLAG_SNIFF | FLAG_RECV_ONLY);
+            println!(
+                "{name}: {}",
+                r.as_ref().map_or_else(|e| e.to_string(), |_| "ok".into())
+            );
+            if r.is_err() {
+                failed.push(name);
+            }
+        }
+        assert!(failed.is_empty(), "{failed:?}");
     }
 }

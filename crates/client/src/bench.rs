@@ -19,7 +19,7 @@ use tracing::info;
 use crate::config::{Config, Node};
 use crate::core::{ClientCore, Exchange};
 use crate::report::{Interval, pct};
-use crate::tunnel::Tunnel;
+use crate::tunnel::{Event, Tunnel};
 
 pub struct BenchArgs {
     pub duration: Duration,
@@ -89,7 +89,8 @@ pub fn run(cfg: &Config, node: &Node, args: &BenchArgs) -> Result<()> {
         cfg.tunnel.pad_max,
         n_paths,
         cfg.tunnel.policy(),
-    );
+    )
+    .with_rekey_interval(cfg.tunnel.rekey_interval());
     info!(node = %node.name, addr = %node.addr, paths = n_paths, "bench: connecting");
     let tunnel = Tunnel::start(core, node, n_paths)?;
     // This thread sends copy 0 of every request, as the capture thread does
@@ -98,9 +99,12 @@ pub fn run(cfg: &Config, node: &Node, args: &BenchArgs) -> Result<()> {
     boost_current_thread();
     let received = Arc::new(Mutex::new(Received::default()));
     let sink = Arc::clone(&received);
-    tunnel.set_echo_sink(Box::new(move |now, id, ts| {
-        let rtt = now.saturating_sub(ts);
-        sink.lock().expect("bench lock").record(id, rtt);
+    tunnel.set_event_sink(Box::new(move |e| {
+        if let Event::Echo { now, id, ts } = e {
+            sink.lock()
+                .expect("bench lock")
+                .record(id, now.saturating_sub(ts));
+        }
     }));
     let deadline = Instant::now() + Duration::from_secs(10);
     while !tunnel.snapshot().connected {

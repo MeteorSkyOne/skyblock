@@ -3,12 +3,14 @@
 //! see SPEC.md §3.
 
 pub mod dedup;
+pub mod dns;
 mod error;
 pub mod flow;
 pub mod frag;
 pub mod frame;
 pub mod handshake;
 pub mod ip;
+pub mod ipfrag;
 pub mod keys;
 pub mod packet;
 pub mod path;

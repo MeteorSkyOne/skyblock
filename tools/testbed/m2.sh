@@ -20,7 +20,7 @@ PIDS=()
 FAILED=0
 
 cleanup() {
-    for p in "${PIDS[@]}"; do kill "$p" 2>/dev/null; done
+    for p in "${PIDS[@]}"; do pkill -P "$p" 2>/dev/null; kill "$p" 2>/dev/null; done
     wait 2>/dev/null
     bash "$NS" down
     rm -rf "$WORK"
@@ -68,6 +68,7 @@ private_key = "$(key_of private_key <<<"$SERVER_KEYS")"
 ports = [40001, 40002]
 egress = "lan0"
 egress_ip = "198.19.0.1"
+control_socket = "$WORK/ctl.sock"
 
 [[user]]
 name = "tester"
@@ -205,15 +206,23 @@ sleep 2
 load=$(in_ns client "$BIN/sbtest" udp-ping --target 198.19.0.3:9000 --count 1000 --interval-ms 8)
 bulk_status=$(tail -1 "$WORK/client.out")
 wait "$SINK"
+# The download goes node -> client: the node classifies it. (The client's
+# `bulk` count covers its own direction, here only the ACKs, which sit
+# around the 2Mbps threshold.)
+sent=$(in_ns server "$BIN/skyblock-server" status -c "$WORK/server.toml" |
+    sed -n 's/^inner packets: .* sent \([0-9]*\) (bulk \([0-9]*\)).*/\1 \2/p')
 echo "  S8 alone:     $(grep '^udp sent' <<<"$base")"
 echo "  S8 with bulk: $(grep '^udp sent' <<<"$load")"
 echo "  S8 download:  $(cat "$WORK/sink.out")"
 echo "  S8 status:    $bulk_status"
+echo "  S8 node sent (all, bulk): $sent"
 b99=$(field p99_us "$base")
 l99=$(field p99_us "$load")
 echo "  S8 game p99 added by the download: $((l99 - b99))us"
 check "S8 download ran" [ -s "$WORK/sink.out" ]
-check "S8 bulk flow classified" grep -q "bulk [1-9]" <<<"$bulk_status"
+mostly_bulk=no
+[ -n "$sent" ] && [ "${sent#* }" -gt "$((${sent% *} / 2))" ] && mostly_bulk=yes
+check "S8 node sent most of the download as bulk" [ "$mostly_bulk" = yes ]
 check "S8 game flow lost nothing" [ "$(field recv "$load")" = 1000 ]
 
 echo "--- client status (last line)"

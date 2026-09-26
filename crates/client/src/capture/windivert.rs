@@ -14,6 +14,10 @@
 //! - Packets whose owner never appears in the tables (connections made by
 //!   other drivers, e.g. other accelerators) go out directly after
 //!   `HOLD_MAX`.
+//! - IP fragments after the first carry no ports; they follow the decision
+//!   made for their datagram's first fragment.
+//! - DNS queries (UDP port 53, any destination, IPv4 or IPv6) are decided
+//!   by name, not by process, and the chosen ones go to the node's resolver.
 
 use std::collections::HashMap;
 use std::net::Ipv4Addr;
@@ -27,6 +31,7 @@ use skyblock_proto::ip::Ipv4Packet;
 use tracing::{debug, info, trace, warn};
 
 use super::{Capture, Sink};
+use crate::dns::{self, Answer, DnsRedirect, Outbound};
 use crate::flows::FlowTable;
 use crate::procmap::{Decision, ProcMap};
 use crate::windivert::{
@@ -80,10 +85,13 @@ const EXCLUDED: [(Ipv4Addr, Ipv4Addr); 9] = [
 /// Socket events worth learning port owners from.
 pub const SOCKET_FILTER: &str = "!loopback and (tcp or udp)";
 
-/// The capture filter: outbound IPv4 TCP/UDP to public addresses other
-/// than the nodes themselves.
-pub fn filter(nodes: &[Ipv4Addr]) -> String {
-    let mut f = String::from("outbound and !loopback and !impostor and ip and (tcp or udp)");
+/// The capture filter: outbound IPv4 TCP/UDP (all fragments) to public
+/// addresses other than the nodes themselves, plus DNS queries to any
+/// address, over IPv4 or IPv6, when `dns` is set.
+pub fn filter(nodes: &[Ipv4Addr], dns: bool) -> String {
+    // `tcp`/`udp` only match packets with a transport header; the protocol
+    // field also matches later fragments.
+    let mut f = String::from("(ip.Protocol == 6 or ip.Protocol == 17)");
     // WinDivert's `not` only applies to a single test, so "outside the
     // range" is spelled out rather than negating a parenthesized group.
     for (lo, hi) in EXCLUDED {
@@ -98,23 +106,52 @@ pub fn filter(nodes: &[Ipv4Addr]) -> String {
     for n in nodes {
         f += &format!(" and ip.DstAddr != {n}");
     }
-    f
+    let head = "outbound and !loopback and !impostor";
+    if dns {
+        format!(
+            "{head} and ((ip and (udp.DstPort == 53 or ({f}))) or (ipv6 and udp.DstPort == 53))"
+        )
+    } else {
+        format!("{head} and ip and {f}")
+    }
 }
 
 /// `(protocol, local port, remote address, remote port)`.
 type FlowKey = (u8, u16, Ipv4Addr, u16);
 
+/// `(protocol, source, destination, identification)` of a fragmented
+/// datagram.
+type FragKey = (u8, Ipv4Addr, Ipv4Addr, u16);
+
 fn flow_key(pkt: &[u8]) -> Option<FlowKey> {
     let p = Ipv4Packet::parse(pkt).ok()?;
-    // Non-first fragments carry no ports (handled in M3).
     let (sport, dport) = p.ports()?;
     Some((p.protocol(), sport, p.dst(), dport))
+}
+
+/// The datagram a fragment belongs to, and whether it is the first one.
+fn frag_key(pkt: &[u8]) -> Option<(FragKey, bool)> {
+    let p = Ipv4Packet::parse(pkt).ok()?;
+    p.is_fragment().then(|| {
+        (
+            (p.protocol(), p.src(), p.dst(), p.ident()),
+            p.frag_offset() == 0,
+        )
+    })
+}
+
+/// What a held packet waits for.
+#[derive(Clone, Copy)]
+enum Pending {
+    Flow(FlowKey),
+    /// A later fragment, for its first fragment's decision.
+    Frag(FragKey),
 }
 
 struct Held {
     pkt: Vec<u8>,
     addr: Address,
-    key: FlowKey,
+    key: Pending,
     since: Instant,
 }
 
@@ -144,25 +181,38 @@ impl Counters {
 
 type Decisions = HashMap<FlowKey, (Decision, Instant)>;
 
+/// Fragment decisions are forgotten after this long.
+const FRAG_TTL: Duration = Duration::from_secs(5);
+
 pub struct WinDivertCapture {
     net: Handle,
     procmap: ProcMap,
     flows: FlowTable<(u32, u32)>,
+    dns: Option<DnsRedirect<(u32, u32)>>,
     decided: Mutex<Decisions>,
+    frags: Mutex<HashMap<FragKey, (Decision, Instant)>>,
     counters: Counters,
 }
 
 impl WinDivertCapture {
-    pub fn open(processes: &[String], nodes: &[Ipv4Addr], vip: Ipv4Addr, mtu: u16) -> Result<Self> {
-        let f = filter(nodes);
+    pub fn open(
+        processes: &[String],
+        nodes: &[Ipv4Addr],
+        vip: Ipv4Addr,
+        mtu: u16,
+        dns: Option<DnsRedirect<(u32, u32)>>,
+    ) -> Result<Self> {
+        let f = filter(nodes, dns.is_some());
         let net = Handle::open(&f, LAYER_NETWORK, 0, 0).context("opening WinDivert")?;
         net.tune_queue();
-        info!(processes = ?processes, "WinDivert capture ready");
+        info!(processes = ?processes, dns = dns.is_some(), "WinDivert capture ready");
         Ok(Self {
             net,
             procmap: ProcMap::new(processes),
             flows: FlowTable::new(vip, mtu),
+            dns,
             decided: Mutex::new(HashMap::new()),
+            frags: Mutex::new(HashMap::new()),
             counters: Counters::default(),
         })
     }
@@ -197,10 +247,48 @@ impl WinDivertCapture {
     }
 
     fn act(&self, decision: Decision, pkt: &mut [u8], addr: &Address, sink: &Sink) {
+        // Later fragments of this datagram will follow.
+        if let Some((key, true)) = frag_key(pkt) {
+            let mut frags = self.frags.lock().expect("fragments lock");
+            if frags.len() >= 256 {
+                frags.retain(|_, (_, at)| at.elapsed() < FRAG_TTL);
+            }
+            frags.insert(key, (decision, Instant::now()));
+        }
         match decision {
             Decision::Tunnel if self.flows.outbound(pkt, addr.interface()) => {
                 Counters::bump(&self.counters.tunneled);
                 sink(pkt)
+            }
+            _ => self.reinject(pkt, addr),
+        }
+    }
+
+    fn frag_decision(&self, key: FragKey) -> Option<Decision> {
+        self.frags
+            .lock()
+            .expect("fragments lock")
+            .get(&key)
+            .map(|e| e.0)
+    }
+
+    /// Sends a DNS query through the node if the rules want it, else
+    /// directly.
+    fn dns_query(
+        &self,
+        dns: &DnsRedirect<(u32, u32)>,
+        pkt: &mut [u8],
+        addr: &Address,
+        sink: &Sink,
+    ) {
+        match dns.outbound(pkt, addr.interface()) {
+            Outbound::Redirected if self.flows.outbound(pkt, addr.interface()) => {
+                Counters::bump(&self.counters.tunneled);
+                sink(pkt);
+            }
+            Outbound::Relayed(mut v4) => {
+                Counters::bump(&self.counters.tunneled);
+                sink(&mut v4);
             }
             _ => self.reinject(pkt, addr),
         }
@@ -227,8 +315,29 @@ impl WinDivertCapture {
                 }
             };
             let pkt = &mut buf[..n];
+            if let Some(d) = self.dns.as_ref().filter(|_| dns::is_query(pkt)) {
+                self.dns_query(d, pkt, &addr, &sink);
+                continue;
+            }
             let Some(key) = flow_key(pkt) else {
-                self.reinject(pkt, &addr);
+                match frag_key(pkt) {
+                    Some((fk, false)) => match self.frag_decision(fk) {
+                        Some(d) => self.act(d, pkt, &addr, &sink),
+                        // The first fragment is still being decided.
+                        None => {
+                            let held = Held {
+                                pkt: pkt.to_vec(),
+                                addr,
+                                key: Pending::Frag(fk),
+                                since: Instant::now(),
+                            };
+                            if hold.send(held).is_err() {
+                                return;
+                            }
+                        }
+                    },
+                    _ => self.reinject(pkt, &addr),
+                }
                 continue;
             };
             match self.fast_path(key) {
@@ -240,7 +349,7 @@ impl WinDivertCapture {
                     let held = Held {
                         pkt: pkt.to_vec(),
                         addr,
-                        key,
+                        key: Pending::Flow(key),
                         since: Instant::now(),
                     };
                     if hold.send(held).is_err() {
@@ -269,29 +378,40 @@ impl WinDivertCapture {
             }
             held.extend(rx.try_iter());
             held.retain_mut(|h| {
-                let (proto, sport, dst, dport) = h.key;
-                match self.verify(h.key) {
-                    Some(d) => {
-                        Counters::bump(&self.counters.verified);
-                        let waited_us = h.since.elapsed().as_micros() as u64;
-                        trace!(proto, sport, %dst, dport, ?d, waited_us, "flow verified");
+                let decision = match h.key {
+                    Pending::Flow(key) => self.verify(key),
+                    Pending::Frag(key) => self.frag_decision(key),
+                };
+                match (decision, h.key) {
+                    (Some(d), key) => {
+                        if let Pending::Flow((proto, sport, dst, dport)) = key {
+                            Counters::bump(&self.counters.verified);
+                            let waited_us = h.since.elapsed().as_micros() as u64;
+                            trace!(proto, sport, %dst, dport, ?d, waited_us, "flow verified");
+                        }
                         self.act(d, &mut h.pkt, &h.addr, &sink);
                         false
                     }
-                    None if h.since.elapsed() >= HOLD_MAX => {
+                    (None, key) if h.since.elapsed() >= HOLD_MAX => {
                         Counters::bump(&self.counters.timed_out);
-                        debug!(proto, sport, %dst, dport, "owner not found; sending directly");
-                        self.decided()
-                            .insert(h.key, (Decision::Bypass, Instant::now()));
+                        if let Pending::Flow(key @ (proto, sport, dst, dport)) = key {
+                            debug!(proto, sport, %dst, dport, "owner not found; sending directly");
+                            self.decided()
+                                .insert(key, (Decision::Bypass, Instant::now()));
+                        }
                         self.reinject(&h.pkt, &h.addr);
                         false
                     }
-                    None => true,
+                    (None, _) => true,
                 }
             });
             if last_report.0.elapsed() >= REPORT_EVERY {
                 self.decided()
                     .retain(|_, (_, last)| last.elapsed() < FLOW_IDLE);
+                self.frags
+                    .lock()
+                    .expect("fragments lock")
+                    .retain(|_, (_, at)| at.elapsed() < FRAG_TTL);
                 let snap = self.counters.snapshot();
                 if snap != last_report.1 {
                     let [fast, verified, timed_out, tunneled] = snap;
@@ -324,6 +444,18 @@ impl WinDivertCapture {
 
 impl Capture for WinDivertCapture {
     fn start(self: Arc<Self>, sink: Sink) -> Result<()> {
+        if self.dns.is_some() {
+            // Names resolved before `up` would stay cached with direct answers.
+            match std::process::Command::new("ipconfig")
+                .arg("/flushdns")
+                .stdout(std::process::Stdio::null())
+                .status()
+            {
+                Ok(s) if s.success() => info!("DNS cache flushed"),
+                Ok(s) => warn!("ipconfig /flushdns failed ({s})"),
+                Err(e) => warn!("ipconfig /flushdns: {e}"),
+            }
+        }
         let events = Handle::open(SOCKET_FILTER, LAYER_SOCKET, 0, FLAG_SNIFF | FLAG_RECV_ONLY)
             .context("opening WinDivert socket layer")?;
         let (tx, rx) = mpsc::channel();
@@ -343,6 +475,17 @@ impl Capture for WinDivertCapture {
     }
 
     fn inject(&self, pkt: &mut [u8]) {
+        if let Some(d) = &self.dns {
+            if let Answer::V6 { packet, iface } = d.inbound(pkt) {
+                if let Err(e) = self
+                    .net
+                    .send(&packet, &Address::inbound_ipv6(iface.0, iface.1))
+                {
+                    debug!("inject (IPv6 DNS answer): {e}");
+                }
+                return;
+            }
+        }
         let Some((if_idx, sub_if_idx)) = self.flows.inbound(pkt) else {
             debug!("inbound packet for an unknown flow");
             return;
@@ -359,13 +502,46 @@ mod tests {
 
     #[test]
     fn filter_text() {
-        let f = filter(&[Ipv4Addr::new(203, 0, 113, 1)]);
-        assert!(f.starts_with("outbound and !loopback and !impostor and ip and (tcp or udp)"));
+        let f = filter(&[Ipv4Addr::new(203, 0, 113, 1)], false);
+        assert!(f.starts_with(
+            "outbound and !loopback and !impostor and ip and (ip.Protocol == 6 or ip.Protocol == 17)"
+        ));
         assert!(f.contains(" and ip.DstAddr > 0.255.255.255 "));
         assert!(f.contains(" and (ip.DstAddr < 192.168.0.0 or ip.DstAddr > 192.168.255.255) "));
         assert!(f.contains(" and ip.DstAddr < 240.0.0.0 "));
         assert!(f.ends_with("and ip.DstAddr != 203.0.113.1"));
         assert!(!f.contains("!("), "WinDivert cannot negate a group");
+
+        let d = filter(&[Ipv4Addr::new(203, 0, 113, 1)], true);
+        assert!(d.starts_with(
+            "outbound and !loopback and !impostor and ((ip and (udp.DstPort == 53 or ((ip.Protocol"
+        ));
+        assert!(d.ends_with("ip.DstAddr != 203.0.113.1))) or (ipv6 and udp.DstPort == 53))"));
+    }
+
+    #[test]
+    fn fragment_keys() {
+        let mut b = vec![0u8; 3100];
+        let n = skyblock_proto::ip::build_udp(
+            &mut b,
+            std::net::SocketAddrV4::new(Ipv4Addr::new(192, 168, 1, 2), 5000),
+            std::net::SocketAddrV4::new(Ipv4Addr::new(203, 0, 113, 9), 27015),
+            77,
+            &[1; 3000],
+        )
+        .unwrap();
+        let frags = skyblock_proto::ipfrag::fragment(&b[..n], 1500).unwrap();
+        let key = (
+            17,
+            Ipv4Addr::new(192, 168, 1, 2),
+            Ipv4Addr::new(203, 0, 113, 9),
+            77,
+        );
+        assert_eq!(frag_key(&frags[0]), Some((key, true)));
+        assert_eq!(frag_key(&frags[1]), Some((key, false)));
+        assert!(flow_key(&frags[0]).is_some(), "first fragment has ports");
+        assert!(flow_key(&frags[1]).is_none());
+        assert_eq!(frag_key(&b[..n]), None);
     }
 
     #[test]

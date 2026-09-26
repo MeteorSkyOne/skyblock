@@ -332,7 +332,7 @@ mod tests {
     /// Opens a packet and returns (seq, copy) of its data frame.
     fn open(rx: &mut RxState, pkt: &[u8]) -> (u32, u8, bool) {
         let mut p = pkt.to_vec();
-        let body = rx.open(&mut p).unwrap();
+        let (body, _) = rx.open(0, &mut p).unwrap();
         let f = FrameReader::new(body).next().unwrap().unwrap();
         let (seq, copy) = match f {
             Frame::Ip(i) => (i.seq, i.copy),
@@ -461,7 +461,7 @@ mod tests {
         s.poll(&mut tx, MS, &r, |_, pkt| out.push(pkt.to_vec()));
         assert_eq!(out.len(), 2);
         let mut p = out[1].clone();
-        let body = rx.open(&mut p).unwrap();
+        let (body, _) = rx.open(0, &mut p).unwrap();
         let f = FrameReader::new(body).next().unwrap().unwrap();
         let Some(Data::EchoReq(e)) = rx.accept(0, &f) else {
             panic!("expected echo request")

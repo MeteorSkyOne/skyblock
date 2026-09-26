@@ -8,9 +8,11 @@ use anyhow::{Context, Result, bail, ensure};
 use ipnet::Ipv4Net;
 use serde::Deserialize;
 use skyblock_proto::Micros;
+use skyblock_proto::dns::normalize_domain;
 use skyblock_proto::frame::MAX_PATHS;
 use skyblock_proto::keys::{PrivateKey, Psk, PublicKey};
 use skyblock_proto::sched::{MAX_COPIES, MAX_COPY_DELAY, Policy};
+use skyblock_proto::timing::SECOND;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -42,6 +44,8 @@ struct RawConfig {
     #[serde(default)]
     tunnel: TunnelConfig,
     #[serde(default)]
+    dns: DnsConfig,
+    #[serde(default)]
     game: Vec<GameConfig>,
     #[serde(default)]
     tun: TunConfig,
@@ -72,6 +76,8 @@ pub struct TunnelConfig {
     /// Flow classification thresholds (SPEC §4.1).
     pub bulk_enter_kbps: u32,
     pub bulk_exit_kbps: u32,
+    /// In-channel rekey interval (SPEC §3.9); 0 turns rekeying off.
+    pub rekey_interval_s: u64,
 }
 
 impl Default for TunnelConfig {
@@ -84,6 +90,7 @@ impl Default for TunnelConfig {
             pad_max: skyblock_proto::packet::DATA_PAD_MAX,
             bulk_enter_kbps: 2000,
             bulk_exit_kbps: 1000,
+            rekey_interval_s: 600,
         }
     }
 }
@@ -99,10 +106,19 @@ impl TunnelConfig {
         }
     }
 
+    /// `None` when rekeying is off.
+    pub fn rekey_interval(&self) -> Option<Micros> {
+        (self.rekey_interval_s > 0).then(|| self.rekey_interval_s * SECOND)
+    }
+
     fn validate(&self) -> Result<()> {
         ensure!(
             (576..=1432).contains(&self.mtu),
             "`tunnel.mtu` must be within 576..=1432"
+        );
+        ensure!(
+            self.rekey_interval_s <= 86_400,
+            "`tunnel.rekey_interval_s` must be at most 86400"
         );
         ensure!(
             (1..=MAX_PATHS).contains(&self.paths),
@@ -137,10 +153,29 @@ pub struct GameConfig {
     #[serde(default)]
     #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     pub ip_ranges: Vec<Ipv4Net>,
-    /// Domain suffixes resolved through the node (M3).
+    /// Domains (and their subdomains) resolved through the node when
+    /// `[dns] mode = "rules"` (SPEC §6.5).
     #[serde(default)]
-    #[allow(dead_code)]
+    #[cfg_attr(not(windows), allow(dead_code))]
     pub domains: Vec<String>,
+}
+
+/// Which DNS queries go through the node (SPEC §6.5).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum DnsMode {
+    /// Queries for the games' `domains`.
+    #[default]
+    Rules,
+    /// Every query (not recommended: domestic sites resolve abroad).
+    All,
+    Off,
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+#[serde(deny_unknown_fields, default)]
+pub struct DnsConfig {
+    pub mode: DnsMode,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -175,6 +210,8 @@ pub struct Config {
     pub default_node: Option<String>,
     pub nodes: Vec<Node>,
     pub tunnel: TunnelConfig,
+    #[cfg_attr(not(windows), allow(dead_code))]
+    pub dns: DnsConfig,
     pub games: Vec<GameConfig>,
     #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     pub tun: TunConfig,
@@ -218,6 +255,13 @@ impl Config {
             if !games.insert(g.name.as_str()) {
                 bail!("duplicate game name {}", g.name);
             }
+            for d in &g.domains {
+                ensure!(
+                    normalize_domain(d).is_some(),
+                    "game {}: empty domain {d:?}",
+                    g.name
+                );
+            }
         }
         Ok(Config {
             private_key: raw.private_key.parse().context("bad private_key")?,
@@ -225,6 +269,7 @@ impl Config {
             default_node: raw.default_node,
             nodes,
             tunnel: raw.tunnel,
+            dns: raw.dns,
             games: raw.game,
             tun: raw.tun,
         })
@@ -346,5 +391,49 @@ mod tests {
         assert_eq!((p.copies, p.copy_delay, p.paths), (3, 1500, 0));
         let d = Config::parse(&base()).unwrap().tunnel;
         assert_eq!((d.paths, d.copies, d.copy_delay_ms), (2, 2, 2.0));
+        assert_eq!(d.rekey_interval(), Some(600 * SECOND));
+        let off = Config::parse(&format!(
+            "{}[tunnel]
+rekey_interval_s = 0
+",
+            base()
+        ))
+        .unwrap();
+        assert_eq!(off.tunnel.rekey_interval(), None);
+    }
+
+    #[test]
+    fn dns_settings() {
+        let c = Config::parse(&base()).unwrap();
+        assert_eq!(c.dns.mode, DnsMode::Rules);
+        let text = format!(
+            "{}[dns]
+mode = \"all\"
+[[game]]
+name = \"lol\"
+domains = [\"riotgames.com\", \".leagueoflegends.com\"]
+",
+            base()
+        );
+        let c = Config::parse(&text).unwrap();
+        assert_eq!(c.dns.mode, DnsMode::All);
+        assert_eq!(c.games[0].domains.len(), 2);
+        assert!(
+            Config::parse(&format!(
+                "{}[dns]
+mode = \"some\"
+",
+                base()
+            ))
+            .is_err()
+        );
+        let empty = format!(
+            "{}[[game]]
+name = \"x\"
+domains = [\".\"]
+",
+            base()
+        );
+        assert!(Config::parse(&empty).is_err());
     }
 }

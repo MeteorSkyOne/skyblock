@@ -1,10 +1,13 @@
 //! Checks on inner packets sent by clients (SPEC §7.7): no spoofed sources,
 //! no reaching private, link-local (cloud metadata) or multicast ranges, nor
-//! the node itself except for UDP (which the NAT treats as hairpin).
+//! the node itself except for UDP (which the NAT treats as hairpin). The
+//! one address inside the VIP subnet a client may use is the DNS resolver,
+//! over UDP port 53.
 
 use std::net::Ipv4Addr;
 
 use ipnet::Ipv4Net;
+use skyblock_proto::dns;
 use skyblock_proto::ip::{Ipv4Packet, PROTO_ICMP, PROTO_TCP, PROTO_UDP};
 
 const DEFAULT_DENY: [&str; 9] = [
@@ -30,6 +33,7 @@ pub struct InnerFilter {
     deny: Vec<Ipv4Net>,
     allow: Vec<Ipv4Net>,
     node_ip: Option<Ipv4Addr>,
+    resolver: Option<Ipv4Addr>,
 }
 
 impl InnerFilter {
@@ -45,7 +49,31 @@ impl InnerFilter {
             deny,
             allow,
             node_ip,
+            resolver: None,
         }
+    }
+
+    /// Lets clients send UDP to `resolver` port 53 (the node's DNS
+    /// forwarder, SPEC §7.5).
+    pub fn with_resolver(mut self, resolver: Ipv4Addr) -> Self {
+        self.resolver = Some(resolver);
+        self
+    }
+
+    /// Whether `resolver:53` over UDP is what `pkt` is addressed to.
+    pub fn is_dns_query<B: AsRef<[u8]>>(&self, pkt: &Ipv4Packet<B>) -> bool {
+        Some(pkt.dst()) == self.resolver
+            && pkt.protocol() == PROTO_UDP
+            && pkt.ports().is_some_and(|(_, dport)| dport == dns::PORT)
+    }
+
+    /// Whether clients may reach `dst` at all (also used for PROBE
+    /// targets, which must not be the node itself either).
+    pub fn destination_allowed(&self, dst: Ipv4Addr) -> bool {
+        if self.allow.iter().any(|n| n.contains(&dst)) {
+            return true;
+        }
+        Some(dst) != self.node_ip && !self.deny.iter().any(|n| n.contains(&dst))
     }
 
     pub fn check<B: AsRef<[u8]>>(&self, vip: Ipv4Addr, pkt: &Ipv4Packet<B>) -> Result<(), Reject> {
@@ -54,6 +82,9 @@ impl InnerFilter {
         }
         if !matches!(pkt.protocol(), PROTO_TCP | PROTO_UDP | PROTO_ICMP) {
             return Err(Reject::Protocol);
+        }
+        if self.is_dns_query(pkt) {
+            return Ok(());
         }
         let dst = pkt.dst();
         if Some(dst) == self.node_ip && pkt.protocol() != PROTO_UDP {
@@ -158,6 +189,41 @@ mod tests {
             f.check(VIP, &Ipv4Packet::parse(&p[..]).unwrap()),
             Err(Reject::Destination)
         );
+    }
+
+    #[test]
+    fn resolver_only_over_udp_53() {
+        let resolver = Ipv4Addr::new(10, 77, 0, 1);
+        let f = filter().with_resolver(resolver);
+        let mut b = vec![0u8; 64];
+        let n = build_udp(
+            &mut b,
+            SocketAddrV4::new(VIP, 5353),
+            SocketAddrV4::new(resolver, 53),
+            0,
+            b"q",
+        )
+        .unwrap();
+        let q = &b[..n];
+        assert_eq!(f.check(VIP, &Ipv4Packet::parse(q).unwrap()), Ok(()));
+        assert!(f.is_dns_query(&Ipv4Packet::parse(q).unwrap()));
+        assert_eq!(
+            check(&f, VIP, resolver),
+            Err(Reject::Destination),
+            "port 2000"
+        );
+        let mut tcp = q.to_vec();
+        tcp[9] = PROTO_TCP;
+        assert!(!f.is_dns_query(&Ipv4Packet::parse(&tcp[..]).unwrap()));
+        assert!(!filter().is_dns_query(&Ipv4Packet::parse(q).unwrap()));
+    }
+
+    #[test]
+    fn probe_destinations() {
+        let f = filter();
+        assert!(f.destination_allowed(Ipv4Addr::new(203, 0, 113, 7)));
+        assert!(!f.destination_allowed(Ipv4Addr::new(169, 254, 169, 254)));
+        assert!(!f.destination_allowed(NODE));
     }
 
     #[test]

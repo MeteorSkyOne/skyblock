@@ -3,30 +3,58 @@
 //! capture backend's threads feeding outbound packets. All share one
 //! [`ClientCore`] behind a mutex; I/O happens after the lock is released,
 //! via per-thread [`Outbox`]es.
+//!
+//! A path's socket can be replaced (rebound) while the tunnel runs: when
+//! the core finds the path silent, when the session died, or at once when
+//! sending on it fails the way a vanished local address does. The new
+//! socket gets a new receive thread; the old thread notices within
+//! `RECV_TIMEOUT` and exits.
 
 use std::cell::RefCell;
 use std::io;
 use std::net::{SocketAddr, UdpSocket};
 use std::ops::Range;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock, RwLock, Weak};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use skyblock_proto::Micros;
+use skyblock_proto::frame::{ProbeReq, ProbeResp};
 use skyblock_proto::handshake::ServerHello;
 use skyblock_proto::ip::Ipv4Packet;
 use skyblock_proto::sched::Policy;
 use skyblock_sys::prio::boost_current_thread;
 use skyblock_sys::timer::Waiter;
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 
 use crate::capture::Capture;
 use crate::config::Node;
 use crate::core::{ClientCore, ClientIo, Snapshot};
 
-/// Receives echo responses (`bench`): arrival time, id, send timestamp.
-pub type EchoSink = Box<dyn Fn(Micros, u32, u64) + Send + Sync>;
+/// How often receive threads check whether their socket was replaced.
+const RECV_TIMEOUT: Duration = Duration::from_millis(250);
+/// Send errors rebind a path at most this often.
+const ERROR_REBIND_EVERY: Duration = Duration::from_secs(1);
+
+/// Things the core reports that `bench` and `ping` collect.
+#[derive(Debug, Clone, Copy)]
+pub enum Event {
+    /// An echo response: arrival time, id, send timestamp.
+    Echo {
+        now: Micros,
+        id: u32,
+        ts: u64,
+    },
+    /// A PONG on `path` after `rtt`.
+    Pong {
+        path: usize,
+        rtt: Micros,
+    },
+    Probe(ProbeResp),
+}
+
+pub type EventSink = Box<dyn Fn(Event) + Send + Sync>;
 
 /// Packets produced under the core lock, sent/injected after it is dropped.
 #[derive(Default)]
@@ -34,7 +62,10 @@ pub struct Outbox {
     buf: Vec<u8>,
     sends: Vec<(usize, Range<usize>)>,
     delivers: Vec<Range<usize>>,
-    echoes: Vec<(Micros, u32, u64)>,
+    events: Vec<Event>,
+    /// Paths to rebind, each with the number of sends queued before the
+    /// request (those still use the old socket).
+    rebinds: Vec<(usize, usize)>,
 }
 
 impl Outbox {
@@ -57,7 +88,19 @@ impl ClientIo for Outbox {
     }
 
     fn echo(&mut self, now: Micros, id: u32, ts: u64) {
-        self.echoes.push((now, id, ts));
+        self.events.push(Event::Echo { now, id, ts });
+    }
+
+    fn pong(&mut self, path: usize, rtt: Micros) {
+        self.events.push(Event::Pong { path, rtt });
+    }
+
+    fn probe(&mut self, resp: ProbeResp) {
+        self.events.push(Event::Probe(resp));
+    }
+
+    fn rebind(&mut self, path: usize) {
+        self.rebinds.push((path, self.sends.len()));
     }
 }
 
@@ -65,46 +108,68 @@ thread_local! {
     static OUTBOX: RefCell<Outbox> = RefCell::new(Outbox::default());
 }
 
+/// One path's socket, replaceable while the tunnel runs.
+struct PathSock {
+    peer: SocketAddr,
+    sock: RwLock<Arc<UdpSocket>>,
+    /// Bumped on every rebind; a receive thread serving an older one exits.
+    generation: AtomicU64,
+    last_error_rebind: Mutex<Option<Instant>>,
+}
+
 pub struct Tunnel {
+    /// For spawning receive threads for rebound sockets.
+    me: Weak<Tunnel>,
     core: Mutex<ClientCore>,
-    socks: Vec<UdpSocket>,
+    paths: Vec<PathSock>,
     start: Instant,
     capture: OnceLock<Arc<dyn Capture>>,
-    echo: OnceLock<EchoSink>,
+    events: OnceLock<EventSink>,
     waiter: Waiter,
     /// When the timer thread plans to wake next; senders that schedule
     /// something earlier wake it.
     wake_at: AtomicU64,
 }
 
+/// A UDP socket connected to `peer` from an ephemeral local port.
+fn open_socket(peer: SocketAddr) -> Result<UdpSocket> {
+    let sock = UdpSocket::bind(("0.0.0.0", 0)).context("binding UDP socket")?;
+    sock.connect(peer)
+        .with_context(|| format!("connecting to {peer}"))?;
+    #[cfg(windows)]
+    disable_udp_connreset(&sock)?;
+    sock.set_read_timeout(Some(RECV_TIMEOUT))?;
+    Ok(sock)
+}
+
 impl Tunnel {
     /// Opens one connected UDP socket per path and starts the receive and
     /// timer threads.
     pub fn start(core: ClientCore, node: &Node, n_paths: usize) -> Result<Arc<Tunnel>> {
-        let mut socks = Vec::with_capacity(n_paths);
+        let mut paths = Vec::with_capacity(n_paths);
         for i in 0..n_paths {
             let peer = SocketAddr::from((node.addr, node.ports[i % node.ports.len()]));
-            let sock = UdpSocket::bind(("0.0.0.0", 0)).context("binding UDP socket")?;
-            sock.connect(peer)
-                .with_context(|| format!("connecting to {peer}"))?;
-            #[cfg(windows)]
-            disable_udp_connreset(&sock)?;
-            socks.push(sock);
+            paths.push(PathSock {
+                peer,
+                sock: RwLock::new(Arc::new(open_socket(peer)?)),
+                generation: AtomicU64::new(0),
+                last_error_rebind: Mutex::new(None),
+            });
         }
-        let t = Arc::new(Tunnel {
+        let waiter = Waiter::new().context("creating timer")?;
+        let t = Arc::new_cyclic(|me| Tunnel {
+            me: me.clone(),
             core: Mutex::new(core),
-            socks,
+            paths,
             start: Instant::now(),
             capture: OnceLock::new(),
-            echo: OnceLock::new(),
-            waiter: Waiter::new().context("creating timer")?,
+            events: OnceLock::new(),
+            waiter,
             wake_at: AtomicU64::new(0),
         });
         for path in 0..n_paths {
-            let rx = Arc::clone(&t);
-            std::thread::Builder::new()
-                .name(format!("path-{path}"))
-                .spawn(move || rx.rx_loop(path))?;
+            let sock = Arc::clone(&t.paths[path].sock.read().expect("socket lock"));
+            t.spawn_rx(path, sock, 0)?;
         }
         let timer = Arc::clone(&t);
         std::thread::Builder::new()
@@ -131,12 +196,25 @@ impl Tunnel {
         }
     }
 
+    /// Like [`wait_connected`](Self::wait_connected), giving up after
+    /// `timeout`.
+    pub fn wait_connected_for(&self, timeout: Duration) -> Option<ServerHello> {
+        let deadline = Instant::now() + timeout;
+        while Instant::now() < deadline {
+            if let Some(h) = self.core().hello() {
+                return Some(h);
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        None
+    }
+
     pub fn set_capture(&self, capture: Arc<dyn Capture>) {
         let _ = self.capture.set(capture);
     }
 
-    pub fn set_echo_sink(&self, sink: EchoSink) {
-        let _ = self.echo.set(sink);
+    pub fn set_event_sink(&self, sink: EventSink) {
+        let _ = self.events.set(sink);
     }
 
     pub fn snapshot(&self) -> Snapshot {
@@ -149,6 +227,22 @@ impl Tunnel {
         let mut out = Outbox::default();
         self.core().set_policy(now, policy, &mut out);
         self.flush(&mut out);
+    }
+
+    /// PINGs every path now.
+    pub fn ping_all(&self) {
+        let now = self.now();
+        let mut out = Outbox::default();
+        self.core().ping_all(now, &mut out);
+        self.flush(&mut out);
+    }
+
+    /// Asks the node to probe a target; `false` without a session.
+    pub fn send_probe(&self, req: ProbeReq) -> bool {
+        let mut out = Outbox::default();
+        let sent = self.core().send_probe(req, &mut out);
+        self.flush(&mut out);
+        sent
     }
 
     /// Sends an outbound IPv4 packet from the capture backend.
@@ -200,20 +294,35 @@ impl Tunnel {
         }
     }
 
-    fn rx_loop(&self, path: usize) {
+    fn spawn_rx(&self, path: usize, sock: Arc<UdpSocket>, generation: u64) -> io::Result<()> {
+        let me = self.me.upgrade().expect("tunnel alive");
+        std::thread::Builder::new()
+            .name(format!("path-{path}"))
+            .spawn(move || me.rx_loop(path, &sock, generation))
+            .map(drop)
+    }
+
+    /// Receives on `sock` until the path moves to a newer socket.
+    fn rx_loop(&self, path: usize, sock: &UdpSocket, generation: u64) {
         let boost = boost_current_thread();
-        debug!(path, ?boost, "receive thread");
-        let sock = &self.socks[path];
+        debug!(path, generation, ?boost, "receive thread");
+        let p = &self.paths[path];
         let mut buf = vec![0u8; 65536];
         let mut out = Outbox::default();
         loop {
+            if p.generation.load(Ordering::Acquire) != generation {
+                return;
+            }
             let n = match sock.recv(&mut buf) {
                 Ok(n) => n,
                 Err(e) => {
-                    // ICMP errors and interrupted calls are transient.
+                    // Timeouts let us notice a new socket; ICMP errors and
+                    // interrupted calls are transient.
                     if !matches!(
                         e.kind(),
-                        io::ErrorKind::ConnectionReset
+                        io::ErrorKind::WouldBlock
+                            | io::ErrorKind::TimedOut
+                            | io::ErrorKind::ConnectionReset
                             | io::ErrorKind::ConnectionRefused
                             | io::ErrorKind::Interrupted
                     ) {
@@ -255,11 +364,50 @@ impl Tunnel {
         }
     }
 
-    fn flush(&self, out: &mut Outbox) {
-        for (path, r) in out.sends.drain(..) {
-            if let Err(e) = self.socks[path].send(&out.buf[r]) {
-                debug!(path, "node send: {e}");
+    /// Replaces `path`'s socket with a fresh one (new local port) and
+    /// starts receiving on it.
+    fn rebind(&self, path: usize) {
+        let p = &self.paths[path];
+        let s = match open_socket(p.peer) {
+            Ok(s) => Arc::new(s),
+            Err(e) => {
+                warn!(path, "cannot open a new socket: {e:#}");
+                return;
             }
+        };
+        let local = s.local_addr().ok();
+        let generation = {
+            let mut cur = p.sock.write().expect("socket lock");
+            *cur = Arc::clone(&s);
+            p.generation.fetch_add(1, Ordering::AcqRel) + 1
+        };
+        if let Err(e) = self.spawn_rx(path, s, generation) {
+            warn!(path, "cannot start a receive thread: {e}");
+        }
+        info!(path, ?local, "path moved to a new socket");
+    }
+
+    fn flush(&self, out: &mut Outbox) {
+        let mut rebinds = std::mem::take(&mut out.rebinds).into_iter().peekable();
+        let mut failed = Vec::new();
+        for (i, (path, r)) in out.sends.drain(..).enumerate() {
+            while let Some((p, _)) = rebinds.next_if(|&(_, before)| before <= i) {
+                self.rebind(p);
+            }
+            let sent = self.paths[path]
+                .sock
+                .read()
+                .expect("socket lock")
+                .send(&out.buf[r]);
+            if let Err(e) = sent {
+                debug!(path, "node send: {e}");
+                if needs_new_socket(&e) && !failed.contains(&path) {
+                    failed.push(path);
+                }
+            }
+        }
+        for (p, _) in rebinds {
+            self.rebind(p);
         }
         if let Some(c) = self.capture.get() {
             for r in out.delivers.drain(..) {
@@ -267,14 +415,50 @@ impl Tunnel {
             }
         }
         out.delivers.clear();
-        if let Some(sink) = self.echo.get() {
-            for (now, id, ts) in out.echoes.drain(..) {
-                sink(now, id, ts);
+        if let Some(sink) = self.events.get() {
+            for e in out.events.drain(..) {
+                sink(e);
             }
         }
-        out.echoes.clear();
+        out.events.clear();
         out.buf.clear();
+        for path in failed {
+            self.rebind_after_error(path);
+        }
     }
+
+    /// Sending failed as it does when the local address went away (network
+    /// change): move the path to a new socket now and PING through it, so
+    /// the node learns the new address without waiting for the path to be
+    /// declared down.
+    fn rebind_after_error(&self, path: usize) {
+        {
+            let mut last = self.paths[path]
+                .last_error_rebind
+                .lock()
+                .expect("rebind lock");
+            if last.is_some_and(|t| t.elapsed() < ERROR_REBIND_EVERY) {
+                return;
+            }
+            *last = Some(Instant::now());
+        }
+        self.rebind(path);
+        let mut out = Outbox::default();
+        self.core().path_rebound(self.now(), path, &mut out);
+        self.flush(&mut out);
+    }
+}
+
+/// Send errors that a fresh socket may cure: the socket's local address is
+/// gone or unusable. ICMP-induced resets and full buffers are not.
+fn needs_new_socket(e: &io::Error) -> bool {
+    !matches!(
+        e.kind(),
+        io::ErrorKind::WouldBlock
+            | io::ErrorKind::Interrupted
+            | io::ErrorKind::ConnectionReset
+            | io::ErrorKind::ConnectionRefused
+    )
 }
 
 /// Stops ICMP port-unreachable from turning into `WSAECONNRESET` on

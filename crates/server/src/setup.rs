@@ -96,33 +96,7 @@ pub fn init(dir: &Path, ports: &[u16], egress_dev: Option<String>) -> Result<()>
         (None, None) => (None, None),
     };
     let key = PrivateKey::generate();
-    let ports = ports
-        .iter()
-        .map(u16::to_string)
-        .collect::<Vec<_>>()
-        .join(", ");
-
-    let mut text = String::new();
-    writeln!(text, "# skyblock-server configuration (SPEC §7.9)")?;
-    writeln!(text, "private_key = \"{}\"", key.to_base64())?;
-    writeln!(text, "# public_key = \"{}\"", key.public_key())?;
-    writeln!(text, "ports = [{ports}]")?;
-    match dev {
-        Some(d) => writeln!(text, "egress = \"{d}\"")?,
-        None => writeln!(text, "# egress = \"eth0\"   # could not auto-detect")?,
-    }
-    if let Some(ip) = ip {
-        writeln!(text, "egress_ip = \"{ip}\"")?;
-    }
-    text.push_str(
-        "# subnet = \"10.77.0.0/16\"
-# mtu = 1400
-# nat_port_range = [20000, 60000]
-# udp_nat_timeout_s = 300
-
-# Users are appended by `skyblock-server adduser`.
-",
-    );
+    let text = config_template(&key, ports, dev.as_deref(), ip)?;
     std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
     std::fs::write(&path, text).with_context(|| format!("writing {}", path.display()))?;
     println!("wrote {}", path.display());
@@ -155,8 +129,47 @@ WantedBy=multi-user.target
         println!("wrote {}", unit_path.display());
         println!("next: skyblock-server adduser <name> <client public key>");
         println!("      systemctl daemon-reload && systemctl enable --now skyblock-server");
+        println!("      skyblock-server status");
     }
     Ok(())
+}
+
+/// The `server.toml` that `init` writes, with the optional keys commented.
+fn config_template(
+    key: &PrivateKey,
+    ports: &[u16],
+    dev: Option<&str>,
+    ip: Option<Ipv4Addr>,
+) -> Result<String> {
+    let ports = ports
+        .iter()
+        .map(u16::to_string)
+        .collect::<Vec<_>>()
+        .join(", ");
+    let mut text = String::new();
+    writeln!(text, "# skyblock-server configuration (SPEC §7.9)")?;
+    writeln!(text, "private_key = \"{}\"", key.to_base64())?;
+    writeln!(text, "# public_key = \"{}\"", key.public_key())?;
+    writeln!(text, "ports = [{ports}]")?;
+    match dev {
+        Some(d) => writeln!(text, "egress = \"{d}\"")?,
+        None => writeln!(text, "# egress = \"eth0\"   # could not auto-detect")?,
+    }
+    if let Some(ip) = ip {
+        writeln!(text, "egress_ip = \"{ip}\"")?;
+    }
+    text.push_str(
+        "# subnet = \"10.77.0.0/16\"
+# mtu = 1400
+# nat_port_range = [20000, 60000]
+# udp_nat_timeout_s = 300
+# dns_upstream = []   # e.g. [\"1.1.1.1\"]; empty: /etc/resolv.conf
+# control_socket = \"/run/skyblock-server.sock\"   # for `skyblock-server status`
+
+# Users are appended by `skyblock-server adduser`.
+",
+    );
+    Ok(text)
 }
 
 pub fn adduser(config: &Path, name: &str, key: PublicKey, with_psk: bool) -> Result<()> {
@@ -233,6 +246,33 @@ mod tests {
         let addr = "2: ens3    inet 192.0.2.10/24 brd 192.0.2.255 scope global dynamic ens3\n";
         assert_eq!(word_after(addr, "inet"), Some("192.0.2.10/24"));
         assert_eq!(word_after("", "dev"), None);
+    }
+
+    #[test]
+    fn init_template_loads_even_uncommented() {
+        let key = PrivateKey::generate();
+        let text = config_template(
+            &key,
+            &[40001, 40002],
+            Some("eth0"),
+            Some(Ipv4Addr::new(192, 0, 2, 1)),
+        )
+        .unwrap();
+        let c = Config::parse(&text).unwrap();
+        assert_eq!(c.ports, vec![40001, 40002]);
+        assert_eq!(c.egress_ip, Some(Ipv4Addr::new(192, 0, 2, 1)));
+        // Every commented default is valid as written.
+        let uncommented: String = text
+            .lines()
+            .map(|l| match l.strip_prefix("# ") {
+                Some(rest) if rest.contains(" = ") && !rest.starts_with("public_key") => rest,
+                _ => l,
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        let c = Config::parse(&uncommented).unwrap();
+        assert!(c.dns_upstream.is_empty());
+        assert!(Config::parse(&config_template(&key, &[1], None, None).unwrap()).is_ok());
     }
 
     #[test]
